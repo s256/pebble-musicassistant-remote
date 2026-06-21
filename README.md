@@ -74,7 +74,7 @@ Fields:
 
 | Field        | Example                  | Notes                                                            |
 | ------------ | ------------------------ | ---------------------------------------------------------------- |
-| **Host**     | `http://192.168.0.206:8095` | Music Assistant base URL. Use `https://` if your server has TLS. |
+| **Host**     | `http://192.168.80.10:8095` | Music Assistant base URL. Use `https://` if your server has TLS. |
 | **Username** | `alice`                  | Built-in MA account.                                             |
 | **Password** | `••••••••`               | Stored locally on the phone — never on the watch.                |
 
@@ -117,20 +117,6 @@ Fields:
 ```
 
 ---
-
-## Versioning
-
-Semantic versioning. Pre-`1.0.0`, direct pushes to `main` are allowed and the API is free to move.
-
-Current version: **0.1.0** — see [CHANGELOG.md](./CHANGELOG.md).
-
----
-
-## Acknowledgements
-
-- [Music Assistant](https://www.music-assistant.io) — the server we talk to.
-- [Rebble](https://rebble.io) for keeping the Pebble platform alive and shipping the Pebble Time 2.
-- [`vincentezw/pebble-ma`](https://github.com/vincentezw/pebble-ma) — prior art that proved the concept.
 
 ## License
 

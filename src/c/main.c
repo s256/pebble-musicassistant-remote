@@ -32,22 +32,25 @@
 #define SCREEN_W 200
 #define SCREEN_H 228
 
-#define STATUSBAR_H 28
-#define TRANSPORT_H 56
-#define TITLE_TOP   8
-#define TITLE_H     32
-#define META_TOP    44
-#define META_H      24
-#define PROGRESS_TOP   132
+// Status bar must be a comfortable touch target — the user goes here to pick
+// a player, so a thin strip won't do.
+#define STATUSBAR_H 44
+#define TRANSPORT_H 52
+#define TITLE_TOP   4
+#define TITLE_H     30
+#define META_TOP    36
+#define META_H      20
+#define PROGRESS_TOP   118
 #define PROGRESS_BAR_H 4
-#define TIME_TOP    142
+#define TIME_TOP    126
 
-#define TRANSPORT_TOP   72
-#define TRANSPORT_BTN_W 56
-#define TRANSPORT_GAP   8
+#define TRANSPORT_TOP   60
+#define TRANSPORT_BTN_W 60
+#define TRANSPORT_GAP   4
 
-#define SHUFFLE_TOP 184
-#define ICON_BTN_W  48
+#define SHUFFLE_TOP 150
+#define SHUFFLE_H   32
+#define ICON_BTN_W  60
 
 #define STATUSBAR_Y (SCREEN_H - STATUSBAR_H)
 
@@ -151,12 +154,108 @@ static MenuLayer  *s_players_menu;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
-static const char *repeat_glyph(RepeatMode r) {
-  switch (r) {
-    case RM_OFF: return "\xE2\x86\xBB"; // ↻ dim
-    case RM_ALL: return "\xE2\x86\xBB";
-    case RM_ONE: return "1";
-    default:     return "?";
+// ─── Icon drawing (native primitives — Pebble fonts don't ship the unicode
+//     transport / shuffle / repeat glyphs we need, so we draw them ourselves
+//     out of triangles, rects and arcs.  Everything centres in `rect`.) ──
+
+static void fill_triangle(GContext *ctx, GPoint a, GPoint b, GPoint c) {
+  GPathInfo info = (GPathInfo){ .num_points = 3, .points = (GPoint[]){a, b, c} };
+  GPath *path = gpath_create(&info);
+  gpath_draw_filled(ctx, path);
+  gpath_destroy(path);
+}
+
+static void icon_play(GContext *ctx, GRect rect, GColor col) {
+  graphics_context_set_fill_color(ctx, col);
+  int cx = rect.origin.x + rect.size.w / 2;
+  int cy = rect.origin.y + rect.size.h / 2;
+  int s  = 14;  // size
+  fill_triangle(ctx,
+                GPoint(cx - s/2,     cy - s),
+                GPoint(cx - s/2,     cy + s),
+                GPoint(cx + s,       cy));
+}
+
+static void icon_pause(GContext *ctx, GRect rect, GColor col) {
+  graphics_context_set_fill_color(ctx, col);
+  int cx = rect.origin.x + rect.size.w / 2;
+  int cy = rect.origin.y + rect.size.h / 2;
+  graphics_fill_rect(ctx, GRect(cx - 8, cy - 12, 5, 24), 1, GCornersAll);
+  graphics_fill_rect(ctx, GRect(cx + 3, cy - 12, 5, 24), 1, GCornersAll);
+}
+
+static void icon_next(GContext *ctx, GRect rect, GColor col) {
+  graphics_context_set_fill_color(ctx, col);
+  int cx = rect.origin.x + rect.size.w / 2;
+  int cy = rect.origin.y + rect.size.h / 2;
+  int s  = 10;
+  fill_triangle(ctx, GPoint(cx - 12, cy - s), GPoint(cx - 12, cy + s), GPoint(cx, cy));
+  fill_triangle(ctx, GPoint(cx,      cy - s), GPoint(cx,      cy + s), GPoint(cx + 12, cy));
+  graphics_fill_rect(ctx, GRect(cx + 12, cy - s, 3, s * 2), 0, GCornerNone);
+}
+
+static void icon_prev(GContext *ctx, GRect rect, GColor col) {
+  graphics_context_set_fill_color(ctx, col);
+  int cx = rect.origin.x + rect.size.w / 2;
+  int cy = rect.origin.y + rect.size.h / 2;
+  int s  = 10;
+  graphics_fill_rect(ctx, GRect(cx - 15, cy - s, 3, s * 2), 0, GCornerNone);
+  fill_triangle(ctx, GPoint(cx + 12, cy - s), GPoint(cx + 12, cy + s), GPoint(cx, cy));
+  fill_triangle(ctx, GPoint(cx,      cy - s), GPoint(cx,      cy + s), GPoint(cx - 12, cy));
+}
+
+static void icon_shuffle(GContext *ctx, GRect rect, GColor col) {
+  graphics_context_set_stroke_color(ctx, col);
+  graphics_context_set_stroke_width(ctx, 2);
+  int x = rect.origin.x + 6;
+  int y = rect.origin.y + rect.size.h / 2;
+  int w = rect.size.w - 12;
+  // Two crossing arrows, simplified.
+  graphics_draw_line(ctx, GPoint(x,        y - 6), GPoint(x + w/2,  y - 6));
+  graphics_draw_line(ctx, GPoint(x + w/2,  y - 6), GPoint(x + w,    y + 6));
+  graphics_draw_line(ctx, GPoint(x,        y + 6), GPoint(x + w/2,  y + 6));
+  graphics_draw_line(ctx, GPoint(x + w/2,  y + 6), GPoint(x + w,    y - 6));
+  // Arrowheads
+  graphics_context_set_fill_color(ctx, col);
+  fill_triangle(ctx, GPoint(x + w,     y + 6), GPoint(x + w - 6, y + 2), GPoint(x + w - 6, y + 10));
+  fill_triangle(ctx, GPoint(x + w,     y - 6), GPoint(x + w - 6, y - 2), GPoint(x + w - 6, y - 10));
+}
+
+static void icon_repeat(GContext *ctx, GRect rect, GColor col, RepeatMode mode) {
+  graphics_context_set_stroke_color(ctx, col);
+  graphics_context_set_stroke_width(ctx, 2);
+  int cx = rect.origin.x + rect.size.w / 2;
+  int cy = rect.origin.y + rect.size.h / 2;
+  // Open square with one arrowhead.
+  graphics_draw_line(ctx, GPoint(cx - 10, cy - 7), GPoint(cx + 8,  cy - 7));
+  graphics_draw_line(ctx, GPoint(cx + 8,  cy - 7), GPoint(cx + 8,  cy + 7));
+  graphics_draw_line(ctx, GPoint(cx + 8,  cy + 7), GPoint(cx - 10, cy + 7));
+  graphics_draw_line(ctx, GPoint(cx - 10, cy + 7), GPoint(cx - 10, cy - 1));
+  graphics_context_set_fill_color(ctx, col);
+  // Arrowhead at top-right pointing right.
+  fill_triangle(ctx, GPoint(cx + 12, cy - 7), GPoint(cx + 6, cy - 11), GPoint(cx + 6, cy - 3));
+  if (mode == RM_ONE) {
+    graphics_context_set_text_color(ctx, col);
+    graphics_draw_text(ctx, "1", fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD),
+                       GRect(cx - 4, cy - 8, 8, 16),
+                       GTextOverflowModeWordWrap, GTextAlignmentCenter, NULL);
+  }
+}
+
+static void icon_speaker(GContext *ctx, GRect rect, GColor col, bool muted) {
+  graphics_context_set_fill_color(ctx, col);
+  int x = rect.origin.x;
+  int cy = rect.origin.y + rect.size.h / 2;
+  // Cabinet
+  graphics_fill_rect(ctx, GRect(x + 1, cy - 5, 4, 10), 0, GCornerNone);
+  // Cone
+  fill_triangle(ctx, GPoint(x + 5, cy - 5), GPoint(x + 5, cy + 5), GPoint(x + 12, cy + 8));
+  fill_triangle(ctx, GPoint(x + 5, cy - 5), GPoint(x + 12, cy + 8), GPoint(x + 12, cy - 8));
+  if (muted) {
+    graphics_context_set_stroke_color(ctx, col);
+    graphics_context_set_stroke_width(ctx, 2);
+    graphics_draw_line(ctx, GPoint(x + 14, cy - 6), GPoint(x + 22, cy + 6));
+    graphics_draw_line(ctx, GPoint(x + 22, cy - 6), GPoint(x + 14, cy + 6));
   }
 }
 
@@ -238,26 +337,26 @@ static void now_root_update(Layer *layer, GContext *ctx) {
                      GRect(8, META_TOP, bounds.size.w - 16, META_H),
                      GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
 
-  // Transport row (centre prev / play|pause / next)
+  // Transport row (centre prev / play|pause / next).  Buttons are framed in
+  // a rounded rect so the touch target is visually obvious.
   int16_t group_w = TRANSPORT_BTN_W * 3 + TRANSPORT_GAP * 2;
   int16_t group_x = (bounds.size.w - group_w) / 2;
-  GRect r_prev = GRect(group_x,                                 TRANSPORT_TOP, TRANSPORT_BTN_W, TRANSPORT_H);
-  GRect r_pp   = GRect(group_x + (TRANSPORT_BTN_W + TRANSPORT_GAP),     TRANSPORT_TOP, TRANSPORT_BTN_W, TRANSPORT_H);
-  GRect r_next = GRect(group_x + (TRANSPORT_BTN_W + TRANSPORT_GAP) * 2, TRANSPORT_TOP, TRANSPORT_BTN_W, TRANSPORT_H);
+  GRect r_prev = GRect(group_x,                                          TRANSPORT_TOP, TRANSPORT_BTN_W, TRANSPORT_H);
+  GRect r_pp   = GRect(group_x + (TRANSPORT_BTN_W + TRANSPORT_GAP),      TRANSPORT_TOP, TRANSPORT_BTN_W, TRANSPORT_H);
+  GRect r_next = GRect(group_x + (TRANSPORT_BTN_W + TRANSPORT_GAP) * 2,  TRANSPORT_TOP, TRANSPORT_BTN_W, TRANSPORT_H);
 
-  graphics_context_set_stroke_color(ctx, GColorDarkGray);
-  graphics_draw_round_rect(ctx, r_prev, 6);
-  graphics_draw_round_rect(ctx, r_pp,   6);
-  graphics_draw_round_rect(ctx, r_next, 6);
+  graphics_context_set_fill_color(ctx, GColorDarkGray);
+  graphics_fill_rect(ctx, r_prev, 6, GCornersAll);
+  graphics_fill_rect(ctx, r_pp,   6, GCornersAll);
+  graphics_fill_rect(ctx, r_next, 6, GCornersAll);
 
-  graphics_context_set_text_color(ctx, GColorWhite);
-  graphics_draw_text(ctx, "\xE2\x8F\xAE", fonts_get_system_font(FONT_KEY_GOTHIC_28_BOLD),
-                     r_prev, GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
-  graphics_draw_text(ctx, s_now.state == PS_PLAYING ? "\xE2\x8F\xB8" : "\xE2\x96\xB6",
-                     fonts_get_system_font(FONT_KEY_GOTHIC_28_BOLD),
-                     r_pp,   GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
-  graphics_draw_text(ctx, "\xE2\x8F\xAD", fonts_get_system_font(FONT_KEY_GOTHIC_28_BOLD),
-                     r_next, GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
+  icon_prev(ctx, r_prev, GColorWhite);
+  if (s_now.state == PS_PLAYING) {
+    icon_pause(ctx, r_pp, GColorWhite);
+  } else {
+    icon_play(ctx, r_pp, GColorWhite);
+  }
+  icon_next(ctx, r_next, GColorWhite);
 
   // Progress bar + times
   draw_progress_bar(ctx, bounds);
@@ -275,31 +374,46 @@ static void now_root_update(Layer *layer, GContext *ctx) {
                      GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
 
   // Shuffle / repeat row
-  int16_t shuf_x = 24;
-  int16_t rep_x  = bounds.size.w - 24 - ICON_BTN_W;
-  GRect r_shuf = GRect(shuf_x, SHUFFLE_TOP, ICON_BTN_W, 28);
-  GRect r_rep  = GRect(rep_x,  SHUFFLE_TOP, ICON_BTN_W, 28);
+  int16_t shuf_x = 20;
+  int16_t rep_x  = bounds.size.w - 20 - ICON_BTN_W;
+  GRect r_shuf = GRect(shuf_x, SHUFFLE_TOP, ICON_BTN_W, SHUFFLE_H);
+  GRect r_rep  = GRect(rep_x,  SHUFFLE_TOP, ICON_BTN_W, SHUFFLE_H);
 
-  graphics_context_set_text_color(ctx, s_now.shuffle ? GColorVividCerulean : GColorLightGray);
-  graphics_draw_text(ctx, "\xF0\x9F\x94\x80", fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
-                     r_shuf, GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
-  graphics_context_set_text_color(ctx, s_now.repeat == RM_OFF ? GColorLightGray : GColorVividCerulean);
-  graphics_draw_text(ctx, repeat_glyph(s_now.repeat), fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
-                     r_rep,  GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
+  // Subtle outline so the touch target is visible even when inactive.
+  graphics_context_set_stroke_color(ctx, GColorDarkGray);
+  graphics_draw_round_rect(ctx, r_shuf, 4);
+  graphics_draw_round_rect(ctx, r_rep,  4);
+  icon_shuffle(ctx, r_shuf, s_now.shuffle ? GColorVividCerulean : GColorLightGray);
+  icon_repeat (ctx, r_rep,  s_now.repeat == RM_OFF ? GColorLightGray : GColorVividCerulean, s_now.repeat);
 
-  // Status bar (player name + volume) — tap target
+  // Status bar (player name + volume) — full-width tap target taking us to
+  // the player list.  Big enough to hit comfortably with a fingertip.
   GRect status = GRect(0, STATUSBAR_Y, bounds.size.w, STATUSBAR_H);
   graphics_context_set_fill_color(ctx, GColorOxfordBlue);
   graphics_fill_rect(ctx, status, 0, GCornerNone);
+
+  // "Tap to switch player" affordance — small chevron on the right edge.
+  graphics_context_set_stroke_color(ctx, GColorWhite);
+  graphics_context_set_stroke_width(ctx, 2);
+  int chev_x = bounds.size.w - 14;
+  int chev_y = STATUSBAR_Y + STATUSBAR_H / 2;
+  graphics_draw_line(ctx, GPoint(chev_x - 4, chev_y - 5), GPoint(chev_x, chev_y));
+  graphics_draw_line(ctx, GPoint(chev_x, chev_y), GPoint(chev_x - 4, chev_y + 5));
+
+  // Player name on the top line.
   graphics_context_set_text_color(ctx, GColorWhite);
   graphics_draw_text(ctx, s_now.player_name,
                      fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
-                     GRect(8, STATUSBAR_Y + 4, bounds.size.w / 2, STATUSBAR_H - 4),
+                     GRect(28, STATUSBAR_Y + 2, bounds.size.w - 44, 22),
                      GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
 
-  int16_t pip_x = bounds.size.w / 2 + 4;
-  int16_t pip_w = bounds.size.w - pip_x - 8;
-  draw_volume_pips(ctx, pip_x, STATUSBAR_Y + 10, pip_w, 8,
+  // Speaker icon + volume pips on the bottom line.
+  GRect r_spk = GRect(6, STATUSBAR_Y + 22, 24, 20);
+  icon_speaker(ctx, r_spk, GColorWhite, s_now.muted);
+
+  int16_t pip_x = 32;
+  int16_t pip_w = bounds.size.w - pip_x - 22;
+  draw_volume_pips(ctx, pip_x, STATUSBAR_Y + 28, pip_w, 8,
                    s_now.muted ? 0 : s_now.volume);
 
   // Error banner (one-line) if anything
@@ -329,8 +443,10 @@ typedef enum {
 } Hit;
 
 static Hit hit_test_now(int16_t x, int16_t y) {
+  // Whole status bar opens the player list — long-press the speaker zone
+  // (left ~32 px) to toggle mute instead.
   if (y >= STATUSBAR_Y) {
-    if (x > SCREEN_W / 2) return HIT_VOLUME_READOUT;
+    if (x < 32) return HIT_VOLUME_READOUT;  // tap speaker → mute
     return HIT_STATUSBAR;
   }
   if (y >= TRANSPORT_TOP && y < TRANSPORT_TOP + TRANSPORT_H) {
@@ -342,7 +458,7 @@ static Hit hit_test_now(int16_t x, int16_t y) {
     if (x >= group_x + (TRANSPORT_BTN_W + TRANSPORT_GAP) * 2 &&
         x <  group_x + (TRANSPORT_BTN_W + TRANSPORT_GAP) * 2 + TRANSPORT_BTN_W) return HIT_NEXT;
   }
-  if (y >= SHUFFLE_TOP && y < SHUFFLE_TOP + 28) {
+  if (y >= SHUFFLE_TOP && y < SHUFFLE_TOP + SHUFFLE_H) {
     if (x < SCREEN_W / 2) return HIT_SHUFFLE;
     return HIT_REPEAT;
   }

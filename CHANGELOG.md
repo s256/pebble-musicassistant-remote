@@ -2,6 +2,19 @@
 
 All notable changes to this project follow [Keep a Changelog](https://keepachangelog.com/) and adhere to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- Transport / shuffle / repeat / speaker icons were rendering as tofu boxes — Pebble's bundled Gothic fonts don't ship the unicode media glyphs we'd used. Replaced them with native-primitive drawings (triangles, rects, arcs).
+- Status bar was uncomfortably small for a touch target. Doubled its height to 44 px, made the whole bar tappable (was previously split between bar and volume readout), and added a chevron affordance on the right edge to show it's interactive.
+- Shuffle / repeat hit boxes enlarged to match the new 32 px icons and given a subtle border so the inactive state is still visibly tappable.
+
+### Docs
+
+- Trimmed README — removed boilerplate sections.
+- Example IP updated to `192.168.80.10` across README and settings page.
+
 ## [0.1.0] — 2026-06-21
 
 Initial bootstrap.
