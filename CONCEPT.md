@@ -1,6 +1,7 @@
 # Pebble Music Assistant Remote — Concept & Architecture
 
-> **Status:** v0.1.0 MVP scope. Architecture stabilises at v1.0.0.
+> **Status:** v0.1.1 shipped — touch + icon polish on v0.1.0. v0.2.0 is the
+> in-progress redesign captured in §4 and §5.  Architecture stabilises at v1.0.0.
 > **Target platform:** Pebble Time 2 (`emery`, 200×228 colour, touchscreen).
 > **Server target:** [Music Assistant](https://www.music-assistant.io) ≥ 2.9 (standalone or Home Assistant add-on).
 
@@ -128,69 +129,205 @@ These live on the *queue*, not the player:
 
 ---
 
-## 4. UI
+## 4. UI (v0.2.0 design — finalised, not yet implemented)
 
-### 4.1 Now-playing (default window)
+The home screen is rebuilt around **Pebble idiom**, not mobile-app convention.
+Three guiding rules that emerged from real Pebble UX research, not the early
+mockups:
+
+1. **The hardware Back button is the universal "up" gesture.** No persistent
+   docks, no global tab bars. Nest sub-screens via `window_stack_push`, return
+   via Back. Every first-party Pebble app does this.
+2. **The right edge is for controls.** Pebble's `ActionBarLayer` is the
+   canonical place for the three hardware buttons (UP / SELECT / DOWN) to be
+   mirrored on-screen — and on Time 2, those icons are also touch targets.
+   Stop drawing custom floating pills; use the idiom.
+3. **State at the bottom, controls on the right.** A wide, readable bottom
+   strip shows *what's currently true* (shuffle, repeat, volume). Glanceable.
+   It's tappable — taps act immediately (no extra sub-screen) — but it's not
+   visually a "button row".
+
+### 4.1 Now-playing
+
+```
+┌───────────────────────────────┐
+│ Front room               ▸   │  header — player name + chevron (tap = list)
+├──────────────────────────┬────┤
+│                          │ ◀◀ │  ← UP = prev   (tap mirrors button)
+│ Track Title              │    │
+│ Artist — Album           ├────┤
+│                          │ ▶  │  ← SELECT = play/pause
+│                          │    │  (long-press = Quick Play menu)
+│ ──────────────────       ├────┤
+│ 1:23 / 4:56              │ ▶▶ │  ← DOWN = next
+│                          │    │
+├──────────────────────────┴────┤
+│  🔀 ON     ↻ ALL     🔈 65%  │  bottom strip — state + tap targets
+└───────────────────────────────┘
+```
+
+- **Right-edge action bar** (≈ 30 px wide) holds prev / play-pause / next.
+  Bound to UP / SELECT / DOWN and tap-bound on Time 2. Pebble Music itself
+  uses this layout — it's instantly familiar.
+- **Bottom status strip** (≥ ~36 px tall — generous, not 16 px sliver):
+  - **Shuffle icon + ON/OFF text** — tap toggles immediately.
+  - **Repeat icon + OFF/ALL/ONE text** — tap cycles immediately.
+  - **Speaker icon + percentage** — tap opens the existing volume window.
+  - Plenty of vertical room for legible text alongside the icons; reads as
+    "current state of playback", not as "menu of buttons".
+- **Header** is the player name + chevron — tap opens the players list.
+- **Long-press SELECT** opens the **Quick Play** menu (see §4.5).
+
+#### Button mapping on the now-playing window
+
+| Button | Short press | Long press |
+|---|---|---|
+| UP | Previous track | — |
+| SELECT | Play / pause | **Open Quick Play** |
+| DOWN | Next track | — |
+| BACK | Exit app | — |
+
+> Volume is no longer on UP/DOWN here — those are transport, matching Pebble
+> Music. To change volume, tap the volume cluster in the strip → opens the
+> volume window where UP/DOWN step volume and SELECT mutes. Back returns.
+
+### 4.2 Players list (unchanged from v0.1.1 — works well)
 
 ```
 ┌──────────────────────────────┐
-│ ♫ Track Title                │  large font, scrolls
-│   Artist — Album             │  medium font
-│                              │
-│        ▶            (state)  │  large state glyph
-│   ◀◀   ⏯   ▶▶               │  3 transport buttons (touch + Pebble SELECT)
-│   🔀   🔁                    │  shuffle / repeat (touch)
-│                              │
-│ ────────────────────         │  progress bar
-│ 1:23 / 4:56                  │
-│                              │
-│ Front room          ▮▮▮▮▯ 70 │  status bar — player + volume — TAPPABLE
+│ Players                      │
+├──────────────────────────────┤
+│ ● Back garden                │  ← green dot = playing
+│   Playing                    │
+├──────────────────────────────┤
+│ ● Bedroom                    │  ← amber dot = paused
+│   Paused                     │
+├──────────────────────────────┤
+│ ● Kitchen                    │  ← grey dot = idle
+│   Idle                       │
 └──────────────────────────────┘
 ```
 
-- **Pebble UP / DOWN** → volume up / down (long-press toggles mute).
-- **Pebble SELECT** → play/pause.
-- **Pebble BACK** → only exits app (system default).
-- **Touch in transport row** → play/pause/next/prev.
-- **Touch on shuffle/repeat glyphs** → toggle.
-- **Tap status bar** → open player list.
-- **Vertical swipe on right edge** → volume slider (post-MVP).
+- Tap a row, or use UP / DOWN + SELECT, to set that player as active.
+- All row text white on black; highlight is white-on-cerulean.
+- Back returns to now-playing.
 
-### 4.2 Player list
+> Future: **long-press a row → group / ungroup menu** (post-MVP, captured
+> for the roadmap but not in 0.2.0 scope).
+
+### 4.3 Volume window (unchanged from v0.2.0 work-in-progress)
 
 ```
 ┌──────────────────────────────┐
-│ Players                  ✕   │
-│ ────────────────────────     │
-│  ▶  Back garden       AUTO   │  active player, marker
-│  ⏸  Bedroom                  │
-│  ◼  Kitchen                  │
-│  ◼  Living room              │
+│ Volume                       │
+│                              │
+│                              │
+│           65 %               │  big readout
+│                              │
+│   🔈 ░░░░░░░░░░             │  chunky bar
+│                              │
+│   UP / DOWN  •  SELECT mutes │
 └──────────────────────────────┘
 ```
 
-- Whole row is a touch target — tap to select that player.
-- Selecting a player flips the override; `AUTO` returns when the user taps the active row twice.
-- The list sorts alphabetically — same order as the auto-select tiebreak.
+- No touch. UP / DOWN step volume (repeating); SELECT toggles mute; Back returns.
 
-### 4.3 Settings entry
+### 4.4 Settings entry
 
-PebbleKit JS catches `showConfiguration` and opens the hosted page (`docs/index.html` on GitHub Pages). User enters host + username + password; on `webviewclosed` the JS persists to `localStorage` and re-auths.
+PebbleKit JS catches `showConfiguration` and opens the hosted page
+(`docs/index.html` on GitHub Pages). User enters host + username + password;
+on `webviewclosed` the JS persists to `localStorage` and re-auths.
+
+The same page also hosts the **Quick Play picker** (see §4.5).
+
+### 4.5 Quick Play (new in v0.2.0)
+
+A small, user-curated set of one-tap shortcuts to start playback of an album,
+artist, or playlist that already exists in Music Assistant.
+
+**How users open it**: long-press SELECT on the now-playing window.
+
+```
+   now-playing
+     ↓ long-press SELECT
+┌──────────────────────────────┐
+│ Quick Play                   │
+├──────────────────────────────┤
+│ ▶ Morning Jazz               │
+│ ▶ Workout                    │
+│ ▶ The Beatles                │
+│ ▶ Daily mix                  │
+└──────────────────────────────┘
+```
+
+- MenuLayer; UP / DOWN scroll, SELECT or tap = play that item on the current
+  active player. Back returns.
+- Empty state: "Add shortcuts in Settings."
+
+#### Configuration
+
+Quick-play entries are configured on the **settings page** (`docs/index.html`).
+
+Up to **10 slots**, each `{ label, uri }` where `uri` is whatever Music Assistant
+accepts in `player_queues/play_media` (e.g. `library://playlist/42`,
+`library://album/…`, `spotify://album/…`).
+
+The settings page does NOT make the user type raw URIs. Once host + credentials
+are filled in and validated, the page gains a **Discover** panel that calls
+Music Assistant's library APIs directly from the browser:
+
+- One search box (debounced) → MA `music/search` or equivalent.
+- Filter chips: **Album · Artist · Playlist**.
+- Tap a result → adds it to the slot list as a new shortcut with a
+  pre-filled label (editable).
+- Drag-and-drop / arrow buttons to reorder the up-to-10 slots.
+- "Save" returns the whole settings blob (including the slot list) to the
+  watch via `pebblejs://close#...` just like today.
+
+##### Auth flow inside the settings page (new)
+
+The settings page now performs its own POST to `<host>/auth/login` to obtain
+a short-lived bearer token, which it uses for the Discover panel's MA calls.
+The token never leaves the browser tab. If auth fails, the page shows an
+inline error and disables Discover, but still lets the user Save host / user /
+password changes.
+
+##### AppMessage contract for slots
+
+Existing `messageKeys` are extended with:
+
+```
+QUICK_BEGIN, QUICK_END                     // marker
+QUICK_ROW_INDEX (int)                       // 0..9
+QUICK_ROW_LABEL (str)                       // up to ~40 chars
+QUICK_ROW_URI   (str)                       // up to ~120 chars
+```
+
+PebbleKit JS pushes the slot list on settings save and on app launch; the
+watch caches it in `persist_*` so the menu is available offline.
+
+When the user picks a slot, the watch sends `CMD_QUICK_PLAY` with the URI as
+`ARG_STR`; the phone calls `player_queues/play_media` with `{ queue_id,
+media: uri, option: "replace" }`.
 
 ---
 
 ## 5. Touchscreen feature catalogue
 
-Mandatory (v0.1.0):
+Mandatory in v0.2.0:
 
-- **Tap status bar** → open player list.
-- **Tap transport icons** → play/pause/next/prev.
-- **Tap shuffle/repeat glyphs** → cycle.
-- **Tap player row** → select active player.
+- **Tap header** → open player list.
+- **Tap action-bar icons** (right edge) → prev / play-pause / next.
+- **Tap shuffle in bottom strip** → toggle immediately.
+- **Tap repeat in bottom strip** → cycle immediately.
+- **Tap volume cluster in bottom strip** → open volume window.
+- **Tap player row in player list** → select active player.
+- **Tap Quick Play row** → start playback on active player.
 
 High value, post-MVP (tracked in roadmap):
 
-- **Drag on volume bar** → scrub volume.
+- **Long-press player row** → group / ungroup menu.
+- **Drag on volume bar (in volume window)** → scrub volume.
 - **Drag on progress bar** → seek within track.
 - **Long-press track title** → favourite.
 - **Swipe down on now-playing** → queue view.
@@ -216,16 +353,18 @@ All gestures are derived in software from the raw `TouchService` events (`Touchd
 
 ## 7. Roadmap
 
-| Version | Theme                | Highlights                                                                            |
-| ------- | -------------------- | ------------------------------------------------------------------------------------- |
-| 0.1.0   | Bootstrap (this)     | MVP feature list above.                                                               |
-| 0.2.0   | Touch upgrades       | Volume drag, progress seek, gesture state machine cleanup.                            |
-| 0.3.0   | Queue & library      | Queue view (swipe down), recently played, favourite toggle.                           |
-| 0.4.0   | Stability            | Exponential reconnect, token refresh, settings validation, error toasts.              |
-| 0.5.0   | Polish               | Album art (where palette allows), animations, App Glance for "now playing".           |
-| 0.6.0   | Multi-watch          | Companion modes (e.g. Pebble Time Round / `chalk`), shared settings.                  |
-| 0.9.0   | Beta hardening       | Field testing, telemetry-free crash log capture, full keyboard nav for settings page. |
-| 1.0.0   | First stable release | Rebble appstore submission, frozen API contract.                                      |
+| Version | Theme                  | Highlights                                                                                                                                                                                                                       |
+| ------- | ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 0.1.0   | Bootstrap              | MVP feature list above.                                                                                                                                                                                                          |
+| 0.1.1   | Touch + icon polish    | Native-primitive icons (no more tofu boxes), enlarged status-bar tap target. **Verified working — revert target if 0.2.x regresses.**                                                                                            |
+| 0.2.0   | **UX rebuild + Quick Play** | ActionBarLayer on the right edge, generous bottom status strip, immediate-toggle shuffle/repeat, **long-press SELECT → Quick Play menu**, Discover panel on the settings page (search MA library, build up to 10 shortcuts). |
+| 0.3.0   | Grouping               | Long-press player row → group / ungroup, group volume readout.                                                                                                                                                                   |
+| 0.4.0   | Queue & library deeper | Queue view (swipe down), recently played, favourite toggle.                                                                                                                                                                      |
+| 0.5.0   | Stability              | Exponential reconnect, token refresh, settings validation, error toasts. Also the 0.2.0 "filed for 0.2.0" punchlist (see CHANGELOG).                                                                                             |
+| 0.6.0   | Polish                 | Album art (where palette allows), animations, App Glance for "now playing".                                                                                                                                                      |
+| 0.7.0   | Multi-watch            | Companion modes (e.g. Pebble Time Round / `chalk`), shared settings.                                                                                                                                                             |
+| 0.9.0   | Beta hardening         | Field testing, telemetry-free crash log capture, full keyboard nav for settings page.                                                                                                                                            |
+| 1.0.0   | First stable release   | Rebble appstore submission, frozen API contract.                                                                                                                                                                                 |
 
 ## 8. Non-goals (for now)
 
