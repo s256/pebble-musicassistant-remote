@@ -1,0 +1,63 @@
+{
+  "name": "pebble-musicassistant-remote",
+  "author": "s256",
+  "version": "0.1.0",
+  "description": "Touch-first Pebble Time 2 remote for Music Assistant.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/s256/pebble-musicassistant-remote.git"
+  },
+  "license": "MIT",
+  "keywords": [
+    "pebble-app",
+    "music-assistant",
+    "rebble"
+  ],
+  "private": true,
+  "dependencies": {},
+  "pebble": {
+    "displayName": "Music Assistant",
+    "uuid": "1876693b-4f58-4146-acd7-784d6616f870",
+    "sdkVersion": "3",
+    "enableMultiJS": true,
+    "targetPlatforms": [
+      "emery"
+    ],
+    "capabilities": [
+      "configurable"
+    ],
+    "watchapp": {
+      "watchface": false
+    },
+    "messageKeys": [
+      "CMD",
+      "ARG_PLAYER_ID",
+      "ARG_INT",
+      "ARG_STR",
+      "READY",
+      "ST_OK",
+      "ST_PLAYER_NAME",
+      "ST_TITLE",
+      "ST_ARTIST",
+      "ST_ALBUM",
+      "ST_STATE",
+      "ST_VOLUME",
+      "ST_MUTED",
+      "ST_SHUFFLE",
+      "ST_REPEAT",
+      "ST_ELAPSED",
+      "ST_DURATION",
+      "ST_ERROR",
+      "PLAYERS_BEGIN",
+      "PLAYERS_CHUNK",
+      "PLAYERS_END",
+      "PLAYER_ROW_ID",
+      "PLAYER_ROW_NAME",
+      "PLAYER_ROW_STATE",
+      "PLAYER_ROW_INDEX"
+    ],
+    "resources": {
+      "media": []
+    }
+  }
+}

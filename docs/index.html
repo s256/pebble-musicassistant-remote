@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Music Assistant Remote — Settings</title>
+<style>
+  :root {
+    --bg:#0e1116; --card:#161b22; --fg:#e6edf3; --muted:#7d8590;
+    --accent:#00b3ff; --accent-fg:#0e1116; --err:#f85149;
+    --border:#30363d; --input:#0d1117;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; padding: 24px 16px 48px;
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: var(--bg); color: var(--fg);
+    display: flex; justify-content: center;
+  }
+  main {
+    width: 100%; max-width: 480px;
+  }
+  h1 {
+    font-size: 22px; margin: 0 0 4px;
+  }
+  p.lede {
+    margin: 0 0 24px; color: var(--muted);
+  }
+  .card {
+    background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+    padding: 20px; margin-bottom: 16px;
+  }
+  label {
+    display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px;
+  }
+  input[type="text"], input[type="password"], input[type="url"] {
+    width: 100%; padding: 12px 14px; font-size: 16px;
+    background: var(--input); color: var(--fg);
+    border: 1px solid var(--border); border-radius: 8px; outline: none;
+    -webkit-appearance: none; appearance: none;
+  }
+  input:focus { border-color: var(--accent); }
+  .row + .row { margin-top: 16px; }
+  .hint { margin-top: 6px; color: var(--muted); font-size: 12px; }
+  .actions { display: flex; gap: 12px; margin-top: 8px; }
+  button {
+    flex: 1; padding: 14px; font-size: 16px; font-weight: 600; border-radius: 8px; border: none;
+    background: var(--accent); color: var(--accent-fg); cursor: pointer;
+  }
+  button.secondary {
+    background: transparent; color: var(--fg); border: 1px solid var(--border);
+  }
+  .err { color: var(--err); margin-top: 8px; font-size: 13px; min-height: 18px; }
+  .ok  { color: #3fb950; margin-top: 8px; font-size: 13px; min-height: 18px; }
+  footer { margin-top: 24px; color: var(--muted); font-size: 12px; text-align: center; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Music Assistant Remote</h1>
+  <p class="lede">Connect your Pebble Time 2 to a Music Assistant server.</p>
+
+  <form class="card" id="form" autocomplete="off">
+    <div class="row">
+      <label for="host">Host</label>
+      <input type="url" id="host" name="host"
+             placeholder="http://192.168.1.10:8095" required
+             autocapitalize="off" autocorrect="off" spellcheck="false" />
+      <div class="hint">
+        Music Assistant base URL. For Home Assistant add-on use the same port (default 8095).
+      </div>
+    </div>
+    <div class="row">
+      <label for="username">Username</label>
+      <input type="text" id="username" name="username"
+             autocapitalize="off" autocorrect="off" spellcheck="false" />
+      <div class="hint">Your built-in Music Assistant username.</div>
+    </div>
+    <div class="row">
+      <label for="password">Password</label>
+      <input type="password" id="password" name="password"
+             autocapitalize="off" autocorrect="off" spellcheck="false" />
+      <div class="hint" id="passHint">Stored locally on your phone.</div>
+    </div>
+    <div class="err" id="msg"></div>
+    <div class="actions">
+      <button type="button" class="secondary" id="cancel">Cancel</button>
+      <button type="submit">Save</button>
+    </div>
+  </form>
+
+  <footer>
+    <a href="https://github.com/s256/pebble-musicassistant-remote" target="_blank" rel="noopener">
+      github.com/s256/pebble-musicassistant-remote
+    </a>
+  </footer>
+</main>
+
+<script>
+(function () {
+  function qs(name) {
+    var m = location.search.match(new RegExp('[?&]' + name + '=([^&]*)'));
+    return m ? decodeURIComponent(m[1].replace(/\+/g, ' ')) : '';
+  }
+
+  var hostEl = document.getElementById('host');
+  var userEl = document.getElementById('username');
+  var passEl = document.getElementById('password');
+  var passHint = document.getElementById('passHint');
+  var msgEl  = document.getElementById('msg');
+
+  hostEl.value = qs('host');
+  userEl.value = qs('user');
+  if (qs('hasPass') === '1') {
+    passEl.placeholder = '•••• (already set — leave blank to keep)';
+    passHint.textContent = 'Leave blank to keep the password you saved before.';
+  }
+
+  function returnToPebble(settings) {
+    var encoded = encodeURIComponent(JSON.stringify(settings));
+    var pebbleUrl = 'pebblejs://close#' + encoded;
+    document.location = pebbleUrl;
+  }
+
+  document.getElementById('cancel').addEventListener('click', function () {
+    document.location = 'pebblejs://close';
+  });
+
+  document.getElementById('form').addEventListener('submit', function (ev) {
+    ev.preventDefault();
+    msgEl.textContent = '';
+    msgEl.className = 'err';
+
+    var host = hostEl.value.trim().replace(/\/+$/, '');
+    var user = userEl.value.trim();
+    var pass = passEl.value;
+
+    if (!/^https?:\/\//i.test(host)) {
+      msgEl.textContent = 'Host must start with http:// or https://';
+      return;
+    }
+    if (!user) {
+      msgEl.textContent = 'Username is required.';
+      return;
+    }
+
+    var settings = { host: host, username: user, password: pass };
+    returnToPebble(settings);
+  });
+})();
+</script>
+</body>
+</html>

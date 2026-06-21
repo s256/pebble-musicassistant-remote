@@ -1,0 +1,33 @@
+# Pebble build output
+build/
+*.pbw
+*.pbz
+.lock-waf*
+.waf-*
+.waf3-*
+
+# Node
+node_modules/
+package-lock.json
+yarn.lock
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude/agent state
+.claude/
+CLAUDE.md
