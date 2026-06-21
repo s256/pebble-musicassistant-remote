@@ -221,7 +221,11 @@ function pushNowPlaying(queue, players) {
   var volume = player && player.volume_level != null ? player.volume_level : 0;
   var muted  = player && player.volume_muted ? 1 : 0;
 
-  var sig = [queue.queue_id, queue.state, title, artist, volume, muted,
+  // Signature for dedup.  elapsed_s is deliberately omitted — the watch
+  // interpolates it locally between pushes, so sending it every poll would
+  // defeat the dedup intent.  album IS included since it can change without
+  // title/artist changing on compilation albums.
+  var sig = [queue.queue_id, queue.state, title, artist, album, volume, muted,
              queue.shuffle_enabled ? 1 : 0, queue.repeat_mode].join('|');
   if (sig === lastSentSig) return;
   lastSentSig = sig;
