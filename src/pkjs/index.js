@@ -219,12 +219,23 @@ function maCall(command, args, cb) {
 //   - controlPlayerId: the player_id we WRITE to (volume / mute / group cmds
 //                      and ST_PLAYER_NAME header readout).  Always the user's
 //                      pick, even when we promoted a master for read state.
+// Sticky memory of whichever queue we last rendered, so a transition that
+// has nothing playing (e.g. the user tapped pause) doesn't snap us to the
+// alphabetically-first paused player.  Distinct from overridePlayerId,
+// which is the EXPLICIT user pick from the player list.  This one is a
+// soft "remember what we showed last time" — defeated by:
+//   - the user picking a different player (sets overridePlayerId),
+//   - the sticky's queue going unavailable,
+//   - another player STARTING to play (the playing branch always wins).
+var lastResolvedQueueId = null;
+
 function pickActiveContext(queues, players) {
   if (!queues || queues.length === 0) return null;
 
   var byName = function (a, b) { return a.display_name.localeCompare(b.display_name); };
   var avail = queues.filter(function (q) { return q.available && q.active; });
   var availFallback = queues.filter(function (q) { return q.available; });
+  var pmap = playersById(players);
 
   // Resolve override.  Two sub-cases:
   //   1. Override is in `avail` already (solo / master) → use it directly,
@@ -234,21 +245,29 @@ function pickActiveContext(queues, players) {
   //      keep the member as controlPlayerId.
   if (overridePlayerId) {
     var direct = avail.find(function (q) { return q.queue_id === overridePlayerId; });
-    if (direct) return { queue: direct, controlPlayerId: direct.queue_id };
+    if (direct) {
+      lastResolvedQueueId = direct.queue_id;
+      return { queue: direct, controlPlayerId: direct.queue_id };
+    }
 
-    var pmap = playersById(players);
     var memberPlayer = pmap[overridePlayerId];
     if (memberPlayer && memberPlayer.synced_to) {
       var masterId = memberPlayer.synced_to;
       var masterQueue = avail.find(function (q) { return q.queue_id === masterId; })
                      || availFallback.find(function (q) { return q.queue_id === masterId; });
-      if (masterQueue) return { queue: masterQueue, controlPlayerId: overridePlayerId };
+      if (masterQueue) {
+        lastResolvedQueueId = masterQueue.queue_id;
+        return { queue: masterQueue, controlPlayerId: overridePlayerId };
+      }
     }
 
     // Override is also in availFallback (e.g. master that's available but
     // inactive) — accept it as-is.
     var fallbackDirect = availFallback.find(function (q) { return q.queue_id === overridePlayerId; });
-    if (fallbackDirect) return { queue: fallbackDirect, controlPlayerId: overridePlayerId };
+    if (fallbackDirect) {
+      lastResolvedQueueId = fallbackDirect.queue_id;
+      return { queue: fallbackDirect, controlPlayerId: overridePlayerId };
+    }
 
     // Override stale; drop it and fall through.
     overridePlayerId = null;
@@ -257,11 +276,36 @@ function pickActiveContext(queues, players) {
   if (avail.length === 0) avail = availFallback;
   if (avail.length === 0) return null;
 
+  // First rule: a player that is actively playing always wins.  This is
+  // what makes "I started Spotify on the speaker, the watch should follow"
+  // work, and it's the only thing that defeats the sticky below.
   var playing = avail.filter(function (q) { return q.state === 'playing'; }).sort(byName);
-  if (playing.length) return { queue: playing[0], controlPlayerId: playing[0].queue_id };
-  var paused  = avail.filter(function (q) { return q.state === 'paused' ; }).sort(byName);
-  if (paused.length)  return { queue: paused[0],  controlPlayerId: paused[0].queue_id  };
+  if (playing.length) {
+    lastResolvedQueueId = playing[0].queue_id;
+    return { queue: playing[0], controlPlayerId: playing[0].queue_id };
+  }
+
+  // Second rule: nothing's playing.  If the queue we showed last time is
+  // still available, KEEP IT — the user just paused, they want to see the
+  // player they paused, not be flipped alphabetically to whatever else is
+  // paused in the house.
+  if (lastResolvedQueueId) {
+    var sticky = avail.find(function (q) { return q.queue_id === lastResolvedQueueId; })
+              || availFallback.find(function (q) { return q.queue_id === lastResolvedQueueId; });
+    if (sticky) return { queue: sticky, controlPlayerId: sticky.queue_id };
+    // last sticky gone — drop it and fall back to alphabetical.
+    lastResolvedQueueId = null;
+  }
+
+  // Third rule: no playing player and no usable sticky.  Fall back to the
+  // most-recently-paused player, else alphabetical first.
+  var paused = avail.filter(function (q) { return q.state === 'paused'; }).sort(byName);
+  if (paused.length) {
+    lastResolvedQueueId = paused[0].queue_id;
+    return { queue: paused[0], controlPlayerId: paused[0].queue_id };
+  }
   var first = avail.slice().sort(byName)[0];
+  lastResolvedQueueId = first.queue_id;
   return { queue: first, controlPlayerId: first.queue_id };
 }
 

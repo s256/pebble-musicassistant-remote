@@ -2,6 +2,12 @@
 
 All notable changes to this project follow [Keep a Changelog](https://keepachangelog.com/) and adhere to [Semantic Versioning](https://semver.org/).
 
+## [1.2.1] — 2026-06-22
+
+### Fixed
+
+- **Pausing playback no longer snaps the watch to the alphabetically-first paused player.** When the active player transitioned from playing to paused, the auto-pick fell back to "first paused player alphabetically" — which is rarely the same one you just paused. The phone-side resolver now remembers whichever queue it last rendered and prefers to keep it across polls, as long as it's still available. Defeated only by another player actually starting to play, or by the user explicitly picking a different player.
+
 ## [1.2.0] — 2026-06-22
 
 Two now-playing screen improvements you asked for after a real-watch testing pass.
@@ -177,6 +183,7 @@ Performance (iridium review, all post-ship polish; no correctness impact):
 - De-duplicate `menu_layer_set_selected_index()` calls during drag in the player list.
 - Rename / parameterise `clamp32` (it actually clamps to 60).
 
+[1.2.1]: https://github.com/s256/pebble-musicassistant-remote/releases/tag/v1.2.1
 [1.2.0]: https://github.com/s256/pebble-musicassistant-remote/releases/tag/v1.2.0
 [1.1.0]: https://github.com/s256/pebble-musicassistant-remote/releases/tag/v1.1.0
 [1.0.1]: https://github.com/s256/pebble-musicassistant-remote/releases/tag/v1.0.1
