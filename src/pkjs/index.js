@@ -321,25 +321,94 @@ function deriveGroupState(player) {
 }
 
 function pushPlayerList(queues, players) {
-  // Sort alphabetically by display_name — same rule as the auto-picker.
-  var list = (queues || []).slice()
-    .filter(function (q) { return q.available; })
-    .sort(function (a, b) { return a.display_name.localeCompare(b.display_name); })
-    .slice(0, 16);
-
+  // Order rules:
+  //  1. Each master is immediately followed by its members (so the indented
+  //     rail in the watch UI visually connects to the right player).
+  //  2. Solo players interleave alphabetically AMONG the masters (treating
+  //     a master's display_name as the cluster's sort key).
+  //  3. Members inside a cluster also sort alphabetically.
+  //
+  // Without this, members render under whatever row sits above them in a
+  // flat alphabetical sort — Living Room synced to Office could appear
+  // indented under Kitchen, etc.
   var pmap = playersById(players);
+  var byName = function (a, b) { return a.display_name.localeCompare(b.display_name); };
+
+  var rows = (queues || []).filter(function (q) { return q.available; });
+
+  // Resolve every row up-front so we can group by master.
+  var resolved = rows.map(function (q) {
+    return { queue: q, grp: deriveGroupState(pmap[q.queue_id]) };
+  });
+
+  // Index by queue_id for member lookup.
+  var byId = {};
+  resolved.forEach(function (r) { byId[r.queue.queue_id] = r; });
+
+  // Walk all rows, pull masters + solos into the top-level cluster key list,
+  // and stash members under their master's id.
+  var clusters = [];           // [{ master: resolvedRow, members: [resolvedRow,...] }]
+  var solos    = [];           // resolvedRow[]
+  var memberBuckets = {};      // masterId -> [resolvedRow,...]
+
+  resolved.forEach(function (r) {
+    var isMaster = (r.grp.flags & ROW_FLAG_MASTER) !== 0;
+    var isMember = (r.grp.flags & ROW_FLAG_MEMBER) !== 0;
+    if (isMaster) {
+      clusters.push({ master: r, members: [] });
+      memberBuckets[r.queue.queue_id] = memberBuckets[r.queue.queue_id] || [];
+    } else if (isMember) {
+      var key = r.grp.syncedTo;
+      memberBuckets[key] = memberBuckets[key] || [];
+      memberBuckets[key].push(r);
+    } else {
+      solos.push(r);
+    }
+  });
+
+  // Attach members to their clusters.  If a "member" reports a synced_to that
+  // isn't in our visible list (rare — server hiccup), treat it as solo so it
+  // still renders.
+  clusters.forEach(function (c) {
+    var bucket = memberBuckets[c.master.queue.queue_id] || [];
+    c.members = bucket.slice().sort(function (a, b) {
+      return a.queue.display_name.localeCompare(b.queue.display_name);
+    });
+  });
+  Object.keys(memberBuckets).forEach(function (k) {
+    if (!byId[k] || !(byId[k].grp.flags & ROW_FLAG_MASTER)) {
+      // orphaned member — fall back to solo
+      memberBuckets[k].forEach(function (r) { solos.push(r); });
+    }
+  });
+
+  // Interleave clusters + solos by name.
+  var top = clusters.map(function (c) { return { kind: 'cluster', name: c.master.queue.display_name, cluster: c }; })
+        .concat(solos.map(function (r) { return { kind: 'solo', name: r.queue.display_name, row: r }; }));
+  top.sort(function (a, b) { return a.name.localeCompare(b.name); });
+
+  // Flatten back to a row sequence.
+  var ordered = [];
+  top.forEach(function (entry) {
+    if (entry.kind === 'cluster') {
+      ordered.push(entry.cluster.master);
+      entry.cluster.members.forEach(function (m) { ordered.push(m); });
+    } else {
+      ordered.push(entry.row);
+    }
+  });
+  ordered = ordered.slice(0, 16);
 
   enqueue({ PLAYERS_BEGIN: 1 });
-  list.forEach(function (q, i) {
-    var grp = deriveGroupState(pmap[q.queue_id]);
+  ordered.forEach(function (r, i) {
     enqueue({
       PLAYER_ROW_INDEX:       i,
-      PLAYER_ROW_ID:          q.queue_id,
-      PLAYER_ROW_NAME:        clamp32(q.display_name),
-      PLAYER_ROW_STATE:       maStateToEnum(q.state),
-      PLAYER_ROW_SYNCED_TO:   clamp32(grp.syncedTo),
-      PLAYER_ROW_GROUP_COUNT: grp.groupCount,
-      PLAYER_ROW_FLAGS:       grp.flags,
+      PLAYER_ROW_ID:          r.queue.queue_id,
+      PLAYER_ROW_NAME:        clamp32(r.queue.display_name),
+      PLAYER_ROW_STATE:       maStateToEnum(r.queue.state),
+      PLAYER_ROW_SYNCED_TO:   clamp32(r.grp.syncedTo),
+      PLAYER_ROW_GROUP_COUNT: r.grp.groupCount,
+      PLAYER_ROW_FLAGS:       r.grp.flags,
     });
   });
   enqueue({ PLAYERS_END: 1 });
@@ -409,6 +478,32 @@ function schedulePoll(ms) {
 
 function quickRepoll() { schedulePoll(POLL_MS_AFTER_ACTION); }
 
+// Pull a fresh snapshot of queues + players and emit a fresh player-list to
+// the watch.  Called on CMD_REQUEST_PLAYERS (when the user opens the list)
+// and after every grouping change so the visible rows reflect the new
+// topology without the user having to back out and re-enter the list.
+function refreshPlayersList() {
+  maCall('player_queues/all', {}, function (err, qres) {
+    if (err) { pushError(err.message); return; }
+    var queues = (qres && qres.result) || qres || [];
+    maCall('players/all', {}, function (perr, pres) {
+      if (perr) { pushError(perr.message); return; }
+      var players = (pres && pres.result) || pres || [];
+      pushPlayerList(queues, players);
+    });
+  });
+}
+
+// Called after any group / ungroup / ungroup_many command settles.  MA
+// applies the membership change asynchronously, so we give it a short beat
+// before refreshing both the now-playing snapshot and the player list.
+function afterGroupingChange() {
+  setTimeout(function () {
+    refreshPlayersList();      // updates s_players[] on the watch in-place
+    quickRepoll();             // refreshes now-playing in case master changed
+  }, 350);
+}
+
 // ─── Active-player resolution for outbound commands ───────────────────────
 
 function withActive(cb) {
@@ -435,15 +530,7 @@ function handleWatchCmd(cmd, payload) {
       pollOnce(); break;
 
     case CMD.REQUEST_PLAYERS:
-      maCall('player_queues/all', {}, function (err, qres) {
-        if (err) { pushError(err.message); return; }
-        var queues = (qres && qres.result) || qres || [];
-        maCall('players/all', {}, function (perr, pres) {
-          if (perr) { pushError(perr.message); return; }
-          var players = (pres && pres.result) || pres || [];
-          pushPlayerList(queues, players);
-        });
-      });
+      refreshPlayersList();
       break;
 
     case CMD.SELECT_PLAYER:
@@ -537,7 +624,13 @@ function handleWatchCmd(cmd, payload) {
       if (!src || !tgt) { pushError('Group: missing player ids'); break; }
       maCall('players/cmd/group',
         { player_id: src, target_player: tgt },
-        function (err) { if (err) pushError(err.message); quickRepoll(); });
+        function (err) {
+          if (err) pushError(err.message);
+          // MA needs a beat to apply the change before the next snapshot
+          // reflects it; the player list on the watch has just popped to
+          // the front so refresh both the now-playing AND the list.
+          afterGroupingChange();
+        });
       break;
     }
 
@@ -546,7 +639,10 @@ function handleWatchCmd(cmd, payload) {
       if (!pid) { pushError('Ungroup: missing player id'); break; }
       maCall('players/cmd/ungroup',
         { player_id: pid },
-        function (err) { if (err) pushError(err.message); quickRepoll(); });
+        function (err) {
+          if (err) pushError(err.message);
+          afterGroupingChange();
+        });
       break;
     }
 
@@ -556,7 +652,10 @@ function handleWatchCmd(cmd, payload) {
       if (ids.length === 0) { pushError('Ungroup all: empty id list'); break; }
       maCall('players/cmd/ungroup_many',
         { player_ids: ids },
-        function (err) { if (err) pushError(err.message); quickRepoll(); });
+        function (err) {
+          if (err) pushError(err.message);
+          afterGroupingChange();
+        });
       break;
     }
 

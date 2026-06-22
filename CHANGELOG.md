@@ -2,6 +2,15 @@
 
 All notable changes to this project follow [Keep a Changelog](https://keepachangelog.com/) and adhere to [Semantic Versioning](https://semver.org/).
 
+## [1.0.1] — 2026-06-22
+
+Two grouping bugs reported from real-watch use.
+
+### Fixed
+
+- **Member rows now indent under their actual master** instead of whichever player happened to sort above them alphabetically. The player list is now built phone-side as a sequence of master-then-members clusters interleaved with solo players (clusters sort by master name; members inside a cluster sort by their own name). Previously a member could appear visually nested under an unrelated player two rows above.
+- **Player list refreshes after a grouping change.** `CMD_GROUP` / `CMD_UNGROUP` / `CMD_UNGROUP_ALL` now trigger an explicit `pushPlayerList` (in addition to the now-playing repoll), with a 350 ms delay so Music Assistant has a beat to apply the change. Previously the watch popped back to a stale list and the user had to back out and re-enter to see the new topology.
+
 ## [1.0.0] — 2026-06-22
 
 First stable release. Feature-complete for the v1 remit; the watchapp is daily-driver ready.
@@ -126,6 +135,7 @@ Performance (iridium review, all post-ship polish; no correctness impact):
 - De-duplicate `menu_layer_set_selected_index()` calls during drag in the player list.
 - Rename / parameterise `clamp32` (it actually clamps to 60).
 
+[1.0.1]: https://github.com/s256/pebble-musicassistant-remote/releases/tag/v1.0.1
 [1.0.0]: https://github.com/s256/pebble-musicassistant-remote/releases/tag/v1.0.0
 [0.3.0]: https://github.com/s256/pebble-musicassistant-remote/releases/tag/v1.0.0
 [0.2.0]: https://github.com/s256/pebble-musicassistant-remote/releases/tag/v0.2.0
