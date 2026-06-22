@@ -510,6 +510,34 @@ static void get_strip_rects(GRect *r_shuf, GRect *r_rep, GRect *r_vol) {
   *r_vol  = GRect(STRIP_ZONE_W * 2, STRIP_Y, SCREEN_W - STRIP_ZONE_W * 2, STRIP_H);
 }
 
+// ─── Marquee state forward decls (full definitions live near the timer) ──
+// Defined here so now_root_update can mention the type and the statics.
+
+typedef enum {
+  MQ_PAUSE_START,
+  MQ_SCROLLING,
+  MQ_PAUSE_END,
+} MarqueePhase;
+
+typedef struct Marquee {
+  char         text[MAX_TRACK_TEXT * 2 + 4];
+  int16_t      text_w;
+  int16_t      frame_w;
+  int16_t      scroll_x;
+  MarqueePhase phase;
+  uint32_t     phase_until_ms;
+  const char  *font_key;
+} Marquee;
+
+static Marquee s_mq_title;
+static Marquee s_mq_meta;
+
+static bool marquee_is_active(const Marquee *m);
+static void marquee_set_text(Marquee *m, const char *new_text, const char *font_key);
+static void marquee_draw(GContext *ctx, Marquee *m, GColor col,
+                         int16_t x, int16_t y, int16_t w, int16_t h);
+static void marquee_tick_schedule(void);
+
 static void now_root_update(Layer *layer, GContext *ctx) {
   GRect bounds = layer_get_bounds(layer);
 
@@ -527,29 +555,24 @@ static void now_root_update(Layer *layer, GContext *ctx) {
                      GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
   icon_chevron_right(ctx, GRect(SCREEN_W - 22, HEADER_Y + 2, 18, HEADER_H - 4), GColorWhite);
 
-  // Title.
-  graphics_context_set_text_color(ctx, GColorWhite);
-  graphics_draw_text(ctx, s_now.title,
-                     fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD),
-                     GRect(6, TITLE_TOP, CONTENT_W - 8, TITLE_H),
-                     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
+  // Title — line 1.  Whatever MA gives us in current_item.name; the queue
+  // typically formats this as "<artist> · <title>" so users see both
+  // pieces at a glance.  Marquees when wider than the slot.
+  marquee_set_text(&s_mq_title, s_now.title, FONT_KEY_GOTHIC_24_BOLD);
+  marquee_draw(ctx, &s_mq_title, GColorWhite,
+               6, TITLE_TOP, CONTENT_W - 8, TITLE_H);
 
-  // Meta.
-  char meta[MAX_TRACK_TEXT * 2 + 4];
-  if (s_now.artist[0] && s_now.album[0]) {
-    snprintf(meta, sizeof(meta), "%s — %s", s_now.artist, s_now.album);
-  } else if (s_now.artist[0]) {
-    snprintf(meta, sizeof(meta), "%s", s_now.artist);
-  } else if (s_now.album[0]) {
-    snprintf(meta, sizeof(meta), "%s", s_now.album);
-  } else {
-    meta[0] = '\0';
+  // Meta — line 2.  Album only; artist already lives in line 1 via
+  // current_item.name.
+  marquee_set_text(&s_mq_meta, s_now.album, FONT_KEY_GOTHIC_18);
+  marquee_draw(ctx, &s_mq_meta, GColorLightGray,
+               6, META_TOP, CONTENT_W - 8, META_H);
+
+  // Kick the marquee tick if either line needs it.  Cheap — the timer
+  // dedupes its own scheduling.
+  if (marquee_is_active(&s_mq_title) || marquee_is_active(&s_mq_meta)) {
+    marquee_tick_schedule();
   }
-  graphics_context_set_text_color(ctx, GColorLightGray);
-  graphics_draw_text(ctx, meta,
-                     fonts_get_system_font(FONT_KEY_GOTHIC_18),
-                     GRect(6, META_TOP, CONTENT_W - 8, META_H),
-                     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
 
   draw_progress_bar(ctx);
 
@@ -565,9 +588,14 @@ static void now_root_update(Layer *layer, GContext *ctx) {
                      GRect(6, TIME_TOP, CONTENT_W - 8, 18),
                      GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
 
-  // Right-edge action column.
+  // Right-edge action column.  Paint a black mask over the full column band
+  // first so the marquee text from the title/meta region doesn't bleed into
+  // the gaps between the rounded pills.
   GRect r_prev, r_pp, r_next;
   get_action_rects(&r_prev, &r_pp, &r_next);
+
+  graphics_context_set_fill_color(ctx, GColorBlack);
+  graphics_fill_rect(ctx, GRect(ACTION_X, ACTION_Y, ACTION_W, ACTION_H), 0, GCornerNone);
 
   graphics_context_set_fill_color(ctx, GColorOxfordBlue);
   graphics_fill_rect(ctx, r_prev, 6, GCornersAll);
@@ -684,15 +712,37 @@ static void players_window_push(void);
 static void volume_window_push(void);
 static void quick_window_push(void);
 
+// Optimistically flip a piece of state locally so the icon updates the
+// instant the user taps, without waiting for the next phone poll (~300 ms).
+// If the server disagrees, the next poll's snapshot overwrites ours.
+static void optimistic_toggle_play_pause(void) {
+  if (s_now.state == PS_PLAYING) s_now.state = PS_PAUSED;
+  else                            s_now.state = PS_PLAYING;
+  if (s_now_root_layer) layer_mark_dirty(s_now_root_layer);
+}
+static void optimistic_toggle_shuffle(void) {
+  s_now.shuffle = !s_now.shuffle;
+  if (s_now_root_layer) layer_mark_dirty(s_now_root_layer);
+}
+static void optimistic_cycle_repeat(void) {
+  s_now.repeat = (s_now.repeat == RM_OFF) ? RM_ALL
+               : (s_now.repeat == RM_ALL) ? RM_ONE
+               :                            RM_OFF;
+  if (s_now_root_layer) layer_mark_dirty(s_now_root_layer);
+}
+
 static void handle_tap_now(int16_t x, int16_t y) {
   Hit h = hit_test_now(x, y);
   LOGD("tap (%d,%d) -> hit=%d", x, y, h);
   switch (h) {
     case HIT_PREV:           send_simple_cmd(CMD_PREVIOUS);       break;
-    case HIT_PLAYPAUSE:      send_simple_cmd(CMD_PLAY_PAUSE);     break;
+    case HIT_PLAYPAUSE:      optimistic_toggle_play_pause();
+                             send_simple_cmd(CMD_PLAY_PAUSE);     break;
     case HIT_NEXT:           send_simple_cmd(CMD_NEXT);           break;
-    case HIT_SHUFFLE:        send_simple_cmd(CMD_SHUFFLE_TOGGLE); break;
-    case HIT_REPEAT:         send_simple_cmd(CMD_REPEAT_CYCLE);   break;
+    case HIT_SHUFFLE:        optimistic_toggle_shuffle();
+                             send_simple_cmd(CMD_SHUFFLE_TOGGLE); break;
+    case HIT_REPEAT:         optimistic_cycle_repeat();
+                             send_simple_cmd(CMD_REPEAT_CYCLE);   break;
     case HIT_VOLUME:         volume_window_push();                break;
     case HIT_HEADER:         send_simple_cmd(CMD_REQUEST_PLAYERS);
                              players_window_push();               break;
@@ -733,7 +783,7 @@ static void touch_now_handler(const TouchEvent *e, void *ctx) {
 
 // ─── Button handlers — now-playing ────────────────────────────────────────
 
-static void btn_now_select(ClickRecognizerRef r, void *c)      { send_simple_cmd(CMD_PLAY_PAUSE); }
+static void btn_now_select(ClickRecognizerRef r, void *c)      { optimistic_toggle_play_pause(); send_simple_cmd(CMD_PLAY_PAUSE); }
 static void btn_now_select_long(ClickRecognizerRef r, void *c) { quick_window_push(); }
 static void btn_now_up(ClickRecognizerRef r, void *c)          { send_simple_cmd(CMD_PREVIOUS);  }
 static void btn_now_down(ClickRecognizerRef r, void *c)        { send_simple_cmd(CMD_NEXT);      }
@@ -743,6 +793,134 @@ static void now_click_config(void *ctx) {
   window_long_click_subscribe(BUTTON_ID_SELECT, 500, btn_now_select_long, NULL);
   window_single_click_subscribe(BUTTON_ID_UP,    btn_now_up);
   window_single_click_subscribe(BUTTON_ID_DOWN,  btn_now_down);
+}
+
+// ─── Marquee state — title + meta lines on the now-playing screen ─────────
+//
+// Each line is its own little state machine.  If the text fits in the frame,
+// we render statically; if it overflows, we pause at the start for 3 s, then
+// scroll the text right-to-left until its trailing edge clears the frame,
+// snap back, pause again, loop.  Driven by a dedicated 25 fps timer that
+// only runs when at least one line is actively scrolling AND the window is
+// visible AND the watch is focused (same gates as the 1 Hz elapsed tick).
+
+#define MARQUEE_PAUSE_MS    3000
+#define MARQUEE_PX_PER_SEC  50
+#define MARQUEE_TICK_MS     40
+#define MARQUEE_GAP_PX      24   // gap between end of text and start of next loop
+
+static AppTimer *s_marquee_timer;
+
+// Returns true when the line is overflowing and currently animating (or
+// waiting between animations).  Static fit-in-frame lines never animate.
+static bool marquee_is_active(const Marquee *m) {
+  return m->text_w > m->frame_w;
+}
+
+// Reset to pause-at-start state — called on track change or when settings
+// load a new text.
+// Monotonic ms counter — Pebble's time_ms() returns seconds with ms via
+// an out param; the legacy "ignore the return value and use the in-out
+// pointer" usage is awkward, so we maintain our own counter incremented by
+// the marquee tick.  Wraps every ~49 days; doesn't matter for us.
+static uint32_t s_mq_clock_ms = 0;
+
+static void marquee_reset(Marquee *m) {
+  m->scroll_x       = 0;
+  m->phase          = MQ_PAUSE_START;
+  m->phase_until_ms = s_mq_clock_ms + MARQUEE_PAUSE_MS;
+  m->text_w         = 0;  // force remeasure
+}
+
+// Update text in-place; reset only if the string actually changed (so a
+// no-op redraw doesn't restart every scroll).  Font key compared by VALUE
+// (strcmp), not pointer — Pebble's font macros expand to string literals
+// and the linker doesn't always merge identical literals across translation
+// units, so `m->font_key == font_key` was sometimes false even when both
+// were FONT_KEY_GOTHIC_24_BOLD, kicking marquee_reset on every paint and
+// wiping scroll_x.
+static void marquee_set_text(Marquee *m, const char *new_text, const char *font_key) {
+  const char *t = new_text ? new_text : "";
+  const char *f = font_key ? font_key : "";
+  bool text_same = strncmp(m->text, t, sizeof(m->text)) == 0;
+  bool font_same = m->font_key && strcmp(m->font_key, f) == 0;
+  if (text_same && font_same) return;
+  strncpy(m->text, t, sizeof(m->text) - 1);
+  m->text[sizeof(m->text) - 1] = '\0';
+  m->font_key = font_key;
+  marquee_reset(m);
+}
+
+// Advance the state machine by `dt_ms`.  Called from the marquee tick.
+// Returns true if anything visibly changed (a draw is needed).
+static bool marquee_advance(Marquee *m, uint32_t now_ms) {
+  if (!marquee_is_active(m)) return false;
+  switch (m->phase) {
+    case MQ_PAUSE_START:
+      if (now_ms >= m->phase_until_ms) {
+        m->phase = MQ_SCROLLING;
+      }
+      return false;
+    case MQ_SCROLLING: {
+      // 25 fps tick = 40 ms = 50 px/s -> 2 px per tick.
+      m->scroll_x += MARQUEE_PX_PER_SEC * MARQUEE_TICK_MS / 1000;
+      if (m->scroll_x >= m->text_w + MARQUEE_GAP_PX) {
+        m->scroll_x       = 0;
+        m->phase          = MQ_PAUSE_END;
+        m->phase_until_ms = now_ms + MARQUEE_PAUSE_MS;
+      }
+      return true;
+    }
+    case MQ_PAUSE_END:
+      if (now_ms >= m->phase_until_ms) {
+        m->phase          = MQ_PAUSE_START;
+        m->phase_until_ms = now_ms + MARQUEE_PAUSE_MS;
+      }
+      return false;
+  }
+  return false;
+}
+
+// Render the marquee into a horizontal slot.  Measures the text once and
+// caches `text_w`; draws plain text if it fits, or a scrolling pair of copies
+// (with a gap) if it doesn't.  The font is fixed per marquee, set by
+// marquee_set_text().
+static void marquee_draw(GContext *ctx, Marquee *m, GColor col, int16_t x, int16_t y,
+                         int16_t w, int16_t h) {
+  if (!m->text[0]) return;
+  GFont font = fonts_get_system_font(m->font_key ? m->font_key : FONT_KEY_GOTHIC_18);
+
+  // Lazy remeasure when text_w == 0 (after marquee_reset).
+  if (m->text_w == 0 || m->frame_w != w) {
+    GSize size = graphics_text_layout_get_content_size(
+        m->text, font, GRect(0, 0, 32000, h),
+        GTextOverflowModeWordWrap, GTextAlignmentLeft);
+    m->text_w  = size.w;
+    m->frame_w = w;
+  }
+  graphics_context_set_text_color(ctx, col);
+
+  if (m->text_w <= w) {
+    // Fits — plain static draw, no scroll.
+    graphics_draw_text(ctx, m->text, font, GRect(x, y, w, h),
+                       GTextOverflowModeFill, GTextAlignmentLeft, NULL);
+    return;
+  }
+
+  // Overflow — draw the text at (x - scroll_x).  The parent layer's bounds
+  // do the visual clipping for us; we don't try to set a sub-clip rect
+  // because Pebble's GContext doesn't expose one.  A second copy at
+  // (text_w + gap) keeps the loop seamless near the wrap point.
+  graphics_draw_text(ctx, m->text, font,
+                     GRect(x - m->scroll_x, y, m->text_w + 32, h),
+                     GTextOverflowModeFill, GTextAlignmentLeft, NULL);
+
+  int16_t second_x = x - m->scroll_x + m->text_w + MARQUEE_GAP_PX;
+  if (second_x < x + w) {
+    graphics_draw_text(ctx, m->text, font,
+                       GRect(second_x, y, m->text_w + 32, h),
+                       GTextOverflowModeFill, GTextAlignmentLeft, NULL);
+  }
 }
 
 // ─── Local interpolation tick ─────────────────────────────────────────────
@@ -756,6 +934,30 @@ static void now_click_config(void *ctx) {
 
 static bool s_app_focused = true;
 static bool s_now_visible = true;
+
+// Marquee tick — independent from the 1 Hz elapsed tick.  Only runs when at
+// least one line is actively scrolling.  Falls silent when both lines fit.
+static void marquee_tick_schedule(void);
+static void marquee_tick_cb(void *ctx) {
+  s_marquee_timer = NULL;
+  if (!s_app_focused || !s_now_visible) return;
+  s_mq_clock_ms += MARQUEE_TICK_MS;
+  bool need_redraw = false;
+  if (marquee_advance(&s_mq_title, s_mq_clock_ms)) need_redraw = true;
+  if (marquee_advance(&s_mq_meta,  s_mq_clock_ms)) need_redraw = true;
+  if (need_redraw && s_now_root_layer) layer_mark_dirty(s_now_root_layer);
+  if (marquee_is_active(&s_mq_title) || marquee_is_active(&s_mq_meta)) {
+    marquee_tick_schedule();
+  }
+}
+static void marquee_tick_schedule(void) {
+  if (s_marquee_timer) return;
+  if (!s_app_focused || !s_now_visible) return;
+  s_marquee_timer = app_timer_register(MARQUEE_TICK_MS, marquee_tick_cb, NULL);
+}
+static void marquee_tick_cancel(void) {
+  if (s_marquee_timer) { app_timer_cancel(s_marquee_timer); s_marquee_timer = NULL; }
+}
 
 static void schedule_tick(void);
 static void tick_cb(void *ctx) {
@@ -778,8 +980,13 @@ static void cancel_tick(void) {
 
 static void app_focus_handler(bool in_focus) {
   s_app_focused = in_focus;
-  if (in_focus) schedule_tick();
-  else          cancel_tick();
+  if (in_focus) {
+    schedule_tick();
+    marquee_tick_schedule();
+  } else {
+    cancel_tick();
+    marquee_tick_cancel();
+  }
 }
 
 // ─── Player list window ───────────────────────────────────────────────────
@@ -2148,16 +2355,18 @@ static void outbox_failed(DictionaryIterator *iter, AppMessageResult reason, voi
 // ─── Now-playing window lifecycle ─────────────────────────────────────────
 
 static void now_window_appear(Window *w) {
-  // Re-arm tick when we come back to the front (sub-window popped, etc).
+  // Re-arm ticks when we come back to the front (sub-window popped, etc).
   s_now_visible = true;
   touch_service_subscribe(touch_now_handler, NULL);
   schedule_tick();
+  marquee_tick_schedule();
 }
 
 static void now_window_disappear(Window *w) {
-  // Sub-window pushed on top OR app backgrounded: stop the redraw loop.
+  // Sub-window pushed on top OR app backgrounded: stop the redraw loops.
   s_now_visible = false;
   cancel_tick();
+  marquee_tick_cancel();
   touch_service_unsubscribe();
 }
 
