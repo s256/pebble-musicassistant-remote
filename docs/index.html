@@ -7,8 +7,8 @@
 <style>
   :root {
     --bg:#0e1116; --card:#161b22; --fg:#e6edf3; --muted:#7d8590;
-    --accent:#00b3ff; --accent-fg:#0e1116; --err:#f85149;
-    --border:#30363d; --input:#0d1117;
+    --accent:#00b3ff; --accent-fg:#0e1116; --err:#f85149; --ok:#3fb950;
+    --border:#30363d; --input:#0d1117; --pill:#21262d; --pill-on:#1f6feb;
   }
   * { box-sizing: border-box; }
   body {
@@ -17,23 +17,19 @@
     background: var(--bg); color: var(--fg);
     display: flex; justify-content: center;
   }
-  main {
-    width: 100%; max-width: 480px;
-  }
-  h1 {
-    font-size: 22px; margin: 0 0 4px;
-  }
-  p.lede {
-    margin: 0 0 24px; color: var(--muted);
-  }
+  main { width: 100%; max-width: 480px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  h2 { font-size: 16px; margin: 0 0 12px; color: var(--fg); }
+  p.lede { margin: 0 0 24px; color: var(--muted); }
   .card {
     background: var(--card); border: 1px solid var(--border); border-radius: 12px;
     padding: 20px; margin-bottom: 16px;
   }
+  .card[hidden] { display: none; }
   label {
     display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px;
   }
-  input[type="text"], input[type="password"], input[type="url"] {
+  input[type="text"], input[type="password"], input[type="url"], input[type="search"] {
     width: 100%; padding: 12px 14px; font-size: 16px;
     background: var(--input); color: var(--fg);
     border: 1px solid var(--border); border-radius: 8px; outline: none;
@@ -50,10 +46,64 @@
   button.secondary {
     background: transparent; color: var(--fg); border: 1px solid var(--border);
   }
-  .err { color: var(--err); margin-top: 8px; font-size: 13px; min-height: 18px; }
-  .ok  { color: #3fb950; margin-top: 8px; font-size: 13px; min-height: 18px; }
+  button.icon {
+    flex: 0 0 auto; width: 36px; padding: 0; font-size: 18px; line-height: 36px;
+    background: var(--pill); color: var(--fg);
+  }
+  button.icon:disabled { opacity: 0.4; cursor: not-allowed; }
+  button[disabled] { opacity: 0.5; cursor: not-allowed; }
+  .msg.err { color: var(--err); margin-top: 8px; font-size: 13px; min-height: 18px; }
+  .msg.ok  { color: var(--ok);  margin-top: 8px; font-size: 13px; min-height: 18px; }
+  .msg     { margin-top: 8px; font-size: 13px; min-height: 18px; color: var(--muted); }
   footer { margin-top: 24px; color: var(--muted); font-size: 12px; text-align: center; }
   a { color: var(--accent); }
+
+  .chips { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+  .chip {
+    padding: 6px 12px; font-size: 13px; border-radius: 999px;
+    background: var(--pill); color: var(--fg); border: 1px solid var(--border);
+    cursor: pointer; user-select: none;
+  }
+  .chip.on { background: var(--pill-on); border-color: var(--pill-on); color: #fff; }
+
+  .results { margin-top: 12px; max-height: 320px; overflow-y: auto; }
+  .results .row-item {
+    display: flex; align-items: center; gap: 10px;
+    padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px;
+    margin-bottom: 6px; cursor: pointer; background: var(--input);
+  }
+  .results .row-item:hover { border-color: var(--accent); }
+  .results .row-item .meta { flex: 1; min-width: 0; }
+  .results .row-item .name {
+    font-size: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .results .row-item .sub {
+    color: var(--muted); font-size: 12px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .results .empty { color: var(--muted); font-size: 13px; padding: 8px 4px; }
+
+  .slot-list { margin-top: 4px; }
+  .slot {
+    display: flex; align-items: center; gap: 8px;
+    padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px;
+    margin-bottom: 6px; background: var(--input);
+  }
+  .slot input.label-edit {
+    flex: 1; padding: 6px 8px; font-size: 14px;
+    background: var(--card); color: var(--fg);
+    border: 1px solid var(--border); border-radius: 6px;
+  }
+  .slot .uri-line {
+    color: var(--muted); font-size: 11px; margin-top: 4px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .slot .label-stack { flex: 1; min-width: 0; }
+  .slot-empty { color: var(--muted); font-size: 13px; padding: 8px 4px; }
+
+  .row-search { display: flex; gap: 8px; align-items: center; }
+  .row-search input { flex: 1; }
+  .loading { color: var(--muted); font-size: 12px; }
 </style>
 </head>
 <body>
@@ -61,7 +111,8 @@
   <h1>Music Assistant Remote</h1>
   <p class="lede">Connect your Pebble Time 2 to a Music Assistant server.</p>
 
-  <form class="card" id="form" autocomplete="off">
+  <section class="card" id="connection-card">
+    <h2>Connection</h2>
     <div class="row">
       <label for="host">Host</label>
       <input type="url" id="host" name="host"
@@ -83,12 +134,42 @@
              autocapitalize="off" autocorrect="off" spellcheck="false" />
       <div class="hint" id="passHint">Stored locally on your phone.</div>
     </div>
-    <div class="err" id="msg"></div>
+    <div class="msg" id="authMsg"></div>
     <div class="actions">
-      <button type="button" class="secondary" id="cancel">Cancel</button>
-      <button type="submit">Save</button>
+      <button type="button" class="secondary" id="testBtn">Test connection</button>
     </div>
-  </form>
+  </section>
+
+  <section class="card" id="discover-card" hidden>
+    <h2>Discover</h2>
+    <p class="hint" style="margin: -4px 0 12px;">
+      Search your library for albums, artists, or playlists to add as Quick Play shortcuts.
+    </p>
+    <div class="row row-search">
+      <input type="search" id="searchInput" placeholder="Search albums, artists, playlists"
+             autocapitalize="off" autocorrect="off" spellcheck="false" />
+    </div>
+    <div class="chips" id="chips">
+      <span class="chip on" data-type="album">Album</span>
+      <span class="chip on" data-type="artist">Artist</span>
+      <span class="chip on" data-type="playlist">Playlist</span>
+    </div>
+    <div class="msg" id="searchMsg"></div>
+    <div class="results" id="results"></div>
+  </section>
+
+  <section class="card" id="slots-card">
+    <h2>Quick Play shortcuts <span id="slotCount" style="color:var(--muted);font-weight:normal;font-size:13px"></span></h2>
+    <p class="hint" style="margin: -4px 0 12px;">
+      Up to 10. Long-press SELECT on the watch's now-playing screen to open them.
+    </p>
+    <div class="slot-list" id="slotList"></div>
+  </section>
+
+  <div class="actions" style="margin-bottom: 24px;">
+    <button type="button" class="secondary" id="cancel">Cancel</button>
+    <button type="button" id="save">Save</button>
+  </div>
 
   <footer>
     <a href="https://github.com/s256/pebble-musicassistant-remote" target="_blank" rel="noopener">
@@ -99,17 +180,34 @@
 
 <script>
 (function () {
+  'use strict';
+
+  var MAX_SLOTS = 10;
+  var MAX_LABEL = 40;
+  var MAX_URI = 120;
+
+  // ─── DOM refs ──────────────────────────────────────────────────────────
+  var hostEl   = document.getElementById('host');
+  var userEl   = document.getElementById('username');
+  var passEl   = document.getElementById('password');
+  var passHint = document.getElementById('passHint');
+  var authMsg  = document.getElementById('authMsg');
+  var testBtn  = document.getElementById('testBtn');
+
+  var discoverCard = document.getElementById('discover-card');
+  var searchInput  = document.getElementById('searchInput');
+  var chipsEl      = document.getElementById('chips');
+  var resultsEl    = document.getElementById('results');
+  var searchMsg    = document.getElementById('searchMsg');
+
+  var slotListEl = document.getElementById('slotList');
+  var slotCount  = document.getElementById('slotCount');
+
+  // ─── Query-string boot ─────────────────────────────────────────────────
   function qs(name) {
     var m = location.search.match(new RegExp('[?&]' + name + '=([^&]*)'));
     return m ? decodeURIComponent(m[1].replace(/\+/g, ' ')) : '';
   }
-
-  var hostEl = document.getElementById('host');
-  var userEl = document.getElementById('username');
-  var passEl = document.getElementById('password');
-  var passHint = document.getElementById('passHint');
-  var msgEl  = document.getElementById('msg');
-
   hostEl.value = qs('host');
   userEl.value = qs('user');
   if (qs('hasPass') === '1') {
@@ -117,37 +215,323 @@
     passHint.textContent = 'Leave blank to keep the password you saved before.';
   }
 
+  // ─── State ─────────────────────────────────────────────────────────────
+  var token = null;
+  var msgId = 1;
+  var activeTypes = { album: true, artist: true, playlist: true };
+  var slots = [];
+
+  try {
+    var rawSlots = qs('slots');
+    if (rawSlots) {
+      var parsed = JSON.parse(rawSlots);
+      if (Array.isArray(parsed)) {
+        slots = parsed.filter(function (s) { return s && s.uri; }).slice(0, MAX_SLOTS);
+      }
+    }
+  } catch (e) { /* ignore malformed */ }
+
+  // ─── Helpers ───────────────────────────────────────────────────────────
+  function setMsg(el, text, kind) {
+    el.textContent = text || '';
+    el.className = 'msg' + (kind ? ' ' + kind : '');
+  }
+
+  function normaliseHost(v) {
+    return String(v || '').trim().replace(/\/+$/, '');
+  }
+
+  function clampStr(s, n) {
+    s = String(s || '');
+    return s.length <= n ? s : s.substring(0, n);
+  }
+
+  function escapeHtml(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
+  // ─── Music Assistant API ───────────────────────────────────────────────
+  function maLogin() {
+    var host = normaliseHost(hostEl.value);
+    var user = userEl.value.trim();
+    var pass = passEl.value;
+    if (!/^https?:\/\//i.test(host)) {
+      return Promise.reject(new Error('Host must start with http:// or https://'));
+    }
+    if (!user) return Promise.reject(new Error('Username is required.'));
+    if (!pass) return Promise.reject(new Error('Password required to authenticate.'));
+
+    return fetch(host + '/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        provider_id: 'builtin',
+        credentials: { username: user, password: pass },
+      }),
+    }).then(function (r) {
+      if (!r.ok) throw new Error('Auth failed (' + r.status + ')');
+      return r.json();
+    }).then(function (body) {
+      if (!body || !body.token) throw new Error('No token in response');
+      token = body.token;
+      return token;
+    });
+  }
+
+  function maCall(command, args) {
+    var host = normaliseHost(hostEl.value);
+    if (!token) return Promise.reject(new Error('Not authenticated'));
+    return fetch(host + '/api', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + token,
+      },
+      body: JSON.stringify({
+        message_id: String(msgId++), command: command, args: args || {},
+      }),
+    }).then(function (r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    });
+  }
+
+  // ─── Test connection / unlock Discover ─────────────────────────────────
+  testBtn.addEventListener('click', function () {
+    setMsg(authMsg, 'Authenticating...', null);
+    testBtn.disabled = true;
+    maLogin().then(function () {
+      setMsg(authMsg, 'Connected.', 'ok');
+      discoverCard.hidden = false;
+      searchInput.focus();
+    }).catch(function (err) {
+      setMsg(authMsg, err.message || String(err), 'err');
+      discoverCard.hidden = true;
+      token = null;
+    }).then(function () {
+      testBtn.disabled = false;
+    });
+  });
+
+  // ─── Filter chips ──────────────────────────────────────────────────────
+  chipsEl.addEventListener('click', function (ev) {
+    var t = ev.target;
+    if (!t.classList || !t.classList.contains('chip')) return;
+    var k = t.getAttribute('data-type');
+    activeTypes[k] = !activeTypes[k];
+    t.classList.toggle('on', activeTypes[k]);
+    runSearch();
+  });
+
+  // ─── Search ────────────────────────────────────────────────────────────
+  var searchTimer = null;
+  searchInput.addEventListener('input', function () {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(runSearch, 300);
+  });
+
+  function selectedMediaTypes() {
+    var out = [];
+    if (activeTypes.album)    out.push('album');
+    if (activeTypes.artist)   out.push('artist');
+    if (activeTypes.playlist) out.push('playlist');
+    return out;
+  }
+
+  function runSearch() {
+    var q = searchInput.value.trim();
+    if (!q || !token) {
+      resultsEl.innerHTML = '';
+      setMsg(searchMsg, '', null);
+      return;
+    }
+    var types = selectedMediaTypes();
+    if (types.length === 0) {
+      resultsEl.innerHTML = '';
+      setMsg(searchMsg, 'Pick at least one filter chip.', null);
+      return;
+    }
+    setMsg(searchMsg, 'Searching...', null);
+    maCall('music/search', {
+      search_query: q,
+      media_types: types,
+      limit: 25,
+    }).then(function (body) {
+      var r = (body && body.result) || {};
+      var rows = [];
+      if (activeTypes.album    && r.albums)    rows = rows.concat(r.albums.map(function (x)    { return { kind: 'album',    item: x }; }));
+      if (activeTypes.artist   && r.artists)   rows = rows.concat(r.artists.map(function (x)   { return { kind: 'artist',   item: x }; }));
+      if (activeTypes.playlist && r.playlists) rows = rows.concat(r.playlists.map(function (x) { return { kind: 'playlist', item: x }; }));
+      renderResults(rows);
+      setMsg(searchMsg, rows.length ? '' : 'No matches.', null);
+    }).catch(function (err) {
+      setMsg(searchMsg, 'Search failed: ' + (err.message || err), 'err');
+    });
+  }
+
+  function renderResults(rows) {
+    if (!rows.length) { resultsEl.innerHTML = ''; return; }
+    var html = rows.map(function (r) {
+      var item = r.item || {};
+      var name = item.name || '(unnamed)';
+      var uri  = item.uri  || '';
+      if (!uri) return '';
+      return '<div class="row-item" data-uri="' + escapeHtml(uri) +
+             '" data-label="' + escapeHtml(name) + '" data-kind="' + r.kind + '">' +
+             '<div class="meta">' +
+             '<div class="name">' + escapeHtml(name) + '</div>' +
+             '<div class="sub">' + r.kind + '</div>' +
+             '</div>' +
+             '<button type="button" class="icon" title="Add">+</button>' +
+             '</div>';
+    }).join('');
+    resultsEl.innerHTML = html;
+  }
+
+  resultsEl.addEventListener('click', function (ev) {
+    var row = ev.target.closest('.row-item');
+    if (!row) return;
+    var uri = row.getAttribute('data-uri');
+    var label = row.getAttribute('data-label');
+    addSlot(label, uri);
+  });
+
+  // ─── Slot list ─────────────────────────────────────────────────────────
+  function addSlot(label, uri) {
+    if (!uri) return;
+    if (slots.length >= MAX_SLOTS) {
+      setMsg(searchMsg, 'Slot list is full (max ' + MAX_SLOTS + ').', 'err');
+      return;
+    }
+    // Skip exact duplicates by URI.
+    if (slots.some(function (s) { return s.uri === uri; })) {
+      setMsg(searchMsg, 'Already added.', null);
+      return;
+    }
+    slots.push({
+      label: clampStr(label || uri, MAX_LABEL),
+      uri:   clampStr(uri, MAX_URI),
+    });
+    renderSlots();
+    setMsg(searchMsg, 'Added.', 'ok');
+  }
+
+  function moveSlot(i, delta) {
+    var j = i + delta;
+    if (j < 0 || j >= slots.length) return;
+    var tmp = slots[i]; slots[i] = slots[j]; slots[j] = tmp;
+    renderSlots();
+  }
+
+  function removeSlot(i) {
+    slots.splice(i, 1);
+    renderSlots();
+  }
+
+  function renderSlots() {
+    slotCount.textContent = '(' + slots.length + '/' + MAX_SLOTS + ')';
+    if (slots.length === 0) {
+      slotListEl.innerHTML = '<div class="slot-empty">No shortcuts yet. Authenticate above and search to add some.</div>';
+      return;
+    }
+    slotListEl.innerHTML = slots.map(function (s, i) {
+      return '<div class="slot" data-idx="' + i + '">' +
+             '<div class="label-stack">' +
+             '<input type="text" class="label-edit" maxlength="' + MAX_LABEL + '" value="' + escapeHtml(s.label) + '" data-act="label" />' +
+             '<div class="uri-line">' + escapeHtml(s.uri) + '</div>' +
+             '</div>' +
+             '<button type="button" class="icon" data-act="up"     title="Move up"' + (i === 0 ? ' disabled' : '') + '>&#9650;</button>' +
+             '<button type="button" class="icon" data-act="down"   title="Move down"' + (i === slots.length - 1 ? ' disabled' : '') + '>&#9660;</button>' +
+             '<button type="button" class="icon" data-act="remove" title="Remove">&times;</button>' +
+             '</div>';
+    }).join('');
+  }
+
+  slotListEl.addEventListener('click', function (ev) {
+    var btn = ev.target.closest('button[data-act]');
+    if (!btn) return;
+    var slot = btn.closest('.slot');
+    var idx = parseInt(slot.getAttribute('data-idx'), 10);
+    var act = btn.getAttribute('data-act');
+    if (act === 'up')     moveSlot(idx, -1);
+    if (act === 'down')   moveSlot(idx, +1);
+    if (act === 'remove') removeSlot(idx);
+  });
+
+  slotListEl.addEventListener('input', function (ev) {
+    var el = ev.target;
+    if (!el.classList.contains('label-edit')) return;
+    var slot = el.closest('.slot');
+    var idx = parseInt(slot.getAttribute('data-idx'), 10);
+    slots[idx].label = clampStr(el.value, MAX_LABEL);
+  });
+
+  // ─── Save / Cancel ─────────────────────────────────────────────────────
+  //
+  // On the real Pebble mobile app, the page closes by navigating to
+  // `pebblejs://close#<payload>` — the app intercepts that scheme.  In the
+  // emulator (`pebble emu-app-config`), pypkjs instead appends a
+  // `?return_to=http://localhost:<port>/close` query param; the page must
+  // POST/redirect there.  We honour `return_to` when present and fall back
+  // to `pebblejs://` otherwise.
+  function getReturnUrl() {
+    var m = location.search.match(/[?&]return_to=([^&]*)/);
+    return m ? decodeURIComponent(m[1]) : null;
+  }
+
   function returnToPebble(settings) {
     var encoded = encodeURIComponent(JSON.stringify(settings));
-    var pebbleUrl = 'pebblejs://close#' + encoded;
-    document.location = pebbleUrl;
+    var ret = getReturnUrl();
+    if (ret) {
+      // Emulator path — pypkjs serves http://localhost:<port>/close and reads
+      // the URL fragment.
+      document.location = ret + encoded;
+    } else {
+      document.location = 'pebblejs://close#' + encoded;
+    }
   }
 
   document.getElementById('cancel').addEventListener('click', function () {
-    document.location = 'pebblejs://close';
+    var ret = getReturnUrl();
+    document.location = ret ? ret : 'pebblejs://close';
   });
 
-  document.getElementById('form').addEventListener('submit', function (ev) {
-    ev.preventDefault();
-    msgEl.textContent = '';
-    msgEl.className = 'err';
-
-    var host = hostEl.value.trim().replace(/\/+$/, '');
+  document.getElementById('save').addEventListener('click', function () {
+    var host = normaliseHost(hostEl.value);
     var user = userEl.value.trim();
     var pass = passEl.value;
 
     if (!/^https?:\/\//i.test(host)) {
-      msgEl.textContent = 'Host must start with http:// or https://';
+      setMsg(authMsg, 'Host must start with http:// or https://', 'err');
       return;
     }
     if (!user) {
-      msgEl.textContent = 'Username is required.';
+      setMsg(authMsg, 'Username is required.', 'err');
       return;
     }
 
-    var settings = { host: host, username: user, password: pass };
-    returnToPebble(settings);
+    var cleanSlots = slots
+      .filter(function (s) { return s && s.uri; })
+      .slice(0, MAX_SLOTS)
+      .map(function (s) {
+        return {
+          label: clampStr(s.label || s.uri, MAX_LABEL),
+          uri:   clampStr(s.uri, MAX_URI),
+        };
+      });
+
+    returnToPebble({
+      host: host,
+      username: user,
+      password: pass,
+      slots: cleanSlots,
+    });
   });
+
+  // ─── Initial render ────────────────────────────────────────────────────
+  renderSlots();
 })();
 </script>
 </body>
