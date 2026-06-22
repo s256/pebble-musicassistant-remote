@@ -136,10 +136,18 @@ static struct {
   uint32_t      duration_s;
   bool          connected;
   char          last_error[MAX_TRACK_TEXT];
+  // v1.1: control player + group volume mirror.  control_player_id is
+  // typed wide enough for any MA player_id (RINCON_* tokens are ~17 chars
+  // but MA accepts arbitrary strings).  group_volume == -1 sentinel means
+  // "not in a group" — the volume window falls back to its single-row layout.
+  char          control_player_id[MAX_PLAYER_ID];
+  int16_t       group_volume;
+  bool          group_muted;
 } s_now = {
   .player_name = "—",
   .title       = "Not connected",
   .state       = PS_UNKNOWN,
+  .group_volume = -1,
 };
 
 static AppTimer *s_tick_timer;
@@ -170,6 +178,13 @@ enum {
   CMD_GROUP           = 13,
   CMD_UNGROUP         = 14,
   CMD_UNGROUP_ALL     = 15,
+  CMD_GROUP_VOLUME_UP   = 16,
+  CMD_GROUP_VOLUME_DOWN = 17,
+  CMD_GROUP_MUTE_TOGGLE = 18,
+  // Emulator-only: open the volume window directly so screenshot capture
+  // doesn't need touch simulation (no `emu-touch` exists).  Never sent by
+  // the JS bridge in real-watch use — same gate as CMD_DEBUG_SEED.
+  CMD_DEBUG_OPEN_VOL  = 98,
   // Emulator-only: populate s_players with a canonical mock group setup.
   CMD_DEBUG_SEED      = 99,
 };
@@ -1511,8 +1526,161 @@ static void groupsheet_window_push(int target_idx) {
 }
 
 // ─── Volume window ────────────────────────────────────────────────────────
+//
+// Two visual layouts:
+//   A. Solo / non-group  — single-row legacy layout (centred big percentage +
+//      chunky bar).  Unchanged from v1.0.
+//   B. Group context      — two stacked rows.  Top row = Group volume, bottom
+//      row = the individual control player.  One row has focus at a time;
+//      UP/DOWN step the focused row, SELECT mutes the focused row, BACK pops.
+//      Touch on any pixel in a row's vertical band changes focus.
 
-static void volume_root_update(Layer *layer, GContext *ctx) {
+typedef enum {
+  VOL_FOCUS_GROUP = 0,
+  VOL_FOCUS_INDIV = 1,
+} VolFocus;
+
+static VolFocus s_vol_focus = VOL_FOCUS_GROUP;
+
+// Layout constants for the two-row variant.  Total = 28 + 2 + 84 + 2 + 84 + 28
+// = 228 = SCREEN_H.  Header strip mirrors the now-playing chrome height; the
+// hint strip leaves room for two lines of 14-pt help text.
+#define V2_HEADER_H   28
+#define V2_HEADER_Y   0
+#define V2_DIV1_Y     28
+#define V2_DIV1_H     2
+#define V2_GROUP_Y    30
+#define V2_ROW_H      84
+#define V2_DIV2_Y     114
+#define V2_DIV2_H     2
+#define V2_INDIV_Y    116
+#define V2_HINT_Y     200
+#define V2_HINT_H     28
+
+static bool in_group_volume_mode(void) {
+  return s_now.group_volume >= 0 && s_now.control_player_id[0] != '\0';
+}
+
+// Draw a single row of the two-row volume window.
+//   row_y      = top pixel of the 84 px row band
+//   focused    = is this the currently selected row?
+//   muted      = is THIS row muted (group_muted or s_now.muted)?
+//   percent    = 0..100 reading for THIS row's bar
+//   title      = "Group" / control player name
+static void draw_vol_row(GContext *ctx, int16_t row_y, bool focused,
+                         bool muted, uint8_t percent, const char *title) {
+  int16_t row_w = SCREEN_W;
+
+  // 4 px accent strip on the left edge.  Cerulean when focused, dark grey
+  // otherwise — this is the primary "which row has focus" affordance.
+  GColor accent = focused ? GColorVividCerulean : GColorDarkGray;
+  graphics_context_set_fill_color(ctx, accent);
+  graphics_fill_rect(ctx, GRect(0, row_y, 4, V2_ROW_H), 0, GCornerNone);
+
+  // Title (left).  Focused = white bold 18, unfocused = light grey bold 18.
+  GColor title_col = focused ? GColorWhite : GColorLightGray;
+  graphics_context_set_text_color(ctx, title_col);
+  graphics_draw_text(ctx, title,
+                     fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
+                     GRect(12, row_y + 8, row_w - 80, 22),
+                     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
+
+  // Percentage readout (right).  Focused = white bold 24; unfocused = dim
+  // grey 18.  When muted we replace the number with "MUTED" in chrome yellow
+  // — keep the colour even in the unfocused row so the user can see at a
+  // glance that the inactive row is muted.
+  char volbuf[8];
+  const char *fnt;
+  GColor pct_col;
+  if (muted) {
+    snprintf(volbuf, sizeof(volbuf), "MUTED");
+    pct_col = GColorChromeYellow;
+    fnt = focused ? FONT_KEY_GOTHIC_18_BOLD : FONT_KEY_GOTHIC_18_BOLD;
+  } else {
+    snprintf(volbuf, sizeof(volbuf), "%u%%", (unsigned)percent);
+    pct_col = focused ? GColorWhite : GColorLightGray;
+    fnt = focused ? FONT_KEY_GOTHIC_24_BOLD : FONT_KEY_GOTHIC_18_BOLD;
+  }
+  graphics_context_set_text_color(ctx, pct_col);
+  graphics_draw_text(ctx, volbuf,
+                     fonts_get_system_font(fnt),
+                     GRect(row_w - 76, row_y + 4, 68, 32),
+                     GTextOverflowModeTrailingEllipsis, GTextAlignmentRight, NULL);
+
+  // Chunky bar.  Rail in dark grey; fill cerulean when focused, GColorBlueMoon
+  // when unfocused.  Muted forces fill width to 0 so the bar reads "empty".
+  int16_t bar_x = 12;
+  int16_t bar_y = row_y + 50;
+  int16_t bar_w = row_w - 24;
+  int16_t bar_h = 14;
+  graphics_context_set_fill_color(ctx, GColorDarkGray);
+  graphics_fill_rect(ctx, GRect(bar_x, bar_y, bar_w, bar_h), 4, GCornersAll);
+  if (!muted && percent > 0) {
+    int16_t fill_w = (int16_t)((uint32_t)bar_w * percent / 100);
+    if (fill_w < 8) fill_w = 8; // keep corner radius visible
+    GColor fill_col = focused ? GColorVividCerulean : GColorBlueMoon;
+    graphics_context_set_fill_color(ctx, fill_col);
+    graphics_fill_rect(ctx, GRect(bar_x, bar_y, fill_w, bar_h), 4, GCornersAll);
+  }
+}
+
+// Two-row variant draw proc.
+static void volume_root_update_group(Layer *layer, GContext *ctx) {
+  GRect bounds = layer_get_bounds(layer);
+
+  graphics_context_set_fill_color(ctx, GColorBlack);
+  graphics_fill_rect(ctx, bounds, 0, GCornerNone);
+
+  // Header strip — control player name + chain glyph when in a group.
+  GRect header = GRect(0, V2_HEADER_Y, SCREEN_W, V2_HEADER_H);
+  graphics_context_set_fill_color(ctx, GColorOxfordBlue);
+  graphics_fill_rect(ctx, header, 0, GCornerNone);
+  graphics_context_set_text_color(ctx, GColorWhite);
+  // Reserve 22 px on the right for the chain badge.
+  graphics_draw_text(ctx, s_now.player_name,
+                     fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
+                     GRect(8, V2_HEADER_Y + 3, SCREEN_W - 30, V2_HEADER_H - 4),
+                     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
+  icon_chain(ctx, GRect(SCREEN_W - 22, V2_HEADER_Y + 8, 16, 12), GColorWhite);
+
+  // Divider beneath the header.
+  graphics_context_set_fill_color(ctx, GColorDarkGray);
+  graphics_fill_rect(ctx, GRect(0, V2_DIV1_Y, SCREEN_W, V2_DIV1_H), 0, GCornerNone);
+
+  // Row 1 — Group.
+  uint8_t group_pct = (s_now.group_volume < 0) ? 0
+                     : (s_now.group_volume > 100 ? 100 : (uint8_t)s_now.group_volume);
+  draw_vol_row(ctx, V2_GROUP_Y, s_vol_focus == VOL_FOCUS_GROUP,
+               s_now.group_muted, group_pct, "Group");
+
+  // Row separator (2 px).
+  graphics_context_set_fill_color(ctx, GColorDarkGray);
+  graphics_fill_rect(ctx, GRect(0, V2_DIV2_Y, SCREEN_W, V2_DIV2_H), 0, GCornerNone);
+
+  // Row 2 — Individual.  Title is the control player's display name (held in
+  // s_now.player_name, which the bugfix now sources from the CONTROL player
+  // not the master).
+  draw_vol_row(ctx, V2_INDIV_Y, s_vol_focus == VOL_FOCUS_INDIV,
+               s_now.muted, s_now.volume, s_now.player_name);
+
+  // Hint strip.
+  GRect hint = GRect(0, V2_HINT_Y, SCREEN_W, V2_HINT_H);
+  graphics_context_set_fill_color(ctx, GColorOxfordBlue);
+  graphics_fill_rect(ctx, hint, 0, GCornerNone);
+  graphics_context_set_text_color(ctx, GColorLightGray);
+  graphics_draw_text(ctx, "UP/DOWN volume - SELECT mutes",
+                     fonts_get_system_font(FONT_KEY_GOTHIC_14),
+                     GRect(0, V2_HINT_Y + 2, SCREEN_W, 14),
+                     GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
+  graphics_draw_text(ctx, "tap to switch",
+                     fonts_get_system_font(FONT_KEY_GOTHIC_14),
+                     GRect(0, V2_HINT_Y + 13, SCREEN_W, 14),
+                     GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
+}
+
+// Single-row legacy layout — used when the control player is solo / not in a
+// group.  Unchanged behaviour from v1.0.
+static void volume_root_update_single(Layer *layer, GContext *ctx) {
   GRect bounds = layer_get_bounds(layer);
 
   graphics_context_set_fill_color(ctx, GColorBlack);
@@ -1555,32 +1723,106 @@ static void volume_root_update(Layer *layer, GContext *ctx) {
 
   // Hint.
   graphics_context_set_text_color(ctx, GColorLightGray);
-  graphics_draw_text(ctx, "UP / DOWN — SELECT mutes",
+  graphics_draw_text(ctx, "UP / DOWN - SELECT mutes",
                      fonts_get_system_font(FONT_KEY_GOTHIC_14),
                      GRect(0, bounds.size.h - 26, bounds.size.w, 20),
                      GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
 }
 
-static void btn_vol_select(ClickRecognizerRef r, void *c) {
-  send_simple_cmd(CMD_MUTE_TOGGLE);
+// Layout-switch dispatcher.
+static void volume_root_update(Layer *layer, GContext *ctx) {
+  if (in_group_volume_mode()) {
+    volume_root_update_group(layer, ctx);
+  } else {
+    volume_root_update_single(layer, ctx);
+  }
 }
-static void btn_vol_up(ClickRecognizerRef r, void *c)     { send_simple_cmd(CMD_VOLUME_UP);   }
-static void btn_vol_down(ClickRecognizerRef r, void *c)   { send_simple_cmd(CMD_VOLUME_DOWN); }
+
+static void btn_vol_select(ClickRecognizerRef r, void *c) {
+  if (in_group_volume_mode() && s_vol_focus == VOL_FOCUS_GROUP) {
+    send_simple_cmd(CMD_GROUP_MUTE_TOGGLE);
+  } else {
+    send_simple_cmd(CMD_MUTE_TOGGLE);
+  }
+}
+static void btn_vol_up(ClickRecognizerRef r, void *c) {
+  if (in_group_volume_mode() && s_vol_focus == VOL_FOCUS_GROUP) {
+    send_simple_cmd(CMD_GROUP_VOLUME_UP);
+  } else {
+    send_simple_cmd(CMD_VOLUME_UP);
+  }
+}
+static void btn_vol_down(ClickRecognizerRef r, void *c) {
+  if (in_group_volume_mode() && s_vol_focus == VOL_FOCUS_GROUP) {
+    send_simple_cmd(CMD_GROUP_VOLUME_DOWN);
+  } else {
+    send_simple_cmd(CMD_VOLUME_DOWN);
+  }
+}
 
 static void volume_click_config(void *ctx) {
+  // SELECT short only — long-press is reserved (spec §6.1.2).
   window_single_click_subscribe(BUTTON_ID_SELECT, btn_vol_select);
   window_single_repeating_click_subscribe(BUTTON_ID_UP,   150, btn_vol_up);
   window_single_repeating_click_subscribe(BUTTON_ID_DOWN, 150, btn_vol_down);
 }
 
+// Touch handler — only meaningful in group mode.  Tap inside either row's
+// vertical band sets focus to that row; header / hint / dividers ignored.
+static void touch_volume_handler(const TouchEvent *e, void *ctx_) {
+  if (!in_group_volume_mode()) return;
+  switch (e->type) {
+    case TouchEvent_Touchdown:
+      s_touch.phase = TG_TRACKING;
+      s_touch.start_x = e->x; s_touch.start_y = e->y;
+      s_touch.last_x  = e->x; s_touch.last_y  = e->y;
+      s_touch.start_ms = time_ms(NULL, NULL);
+      break;
+    case TouchEvent_PositionUpdate:
+      s_touch.last_x = e->x; s_touch.last_y = e->y;
+      break;
+    case TouchEvent_Liftoff: {
+      if (s_touch.phase != TG_TRACKING) break;
+      int16_t dx = s_touch.last_x - s_touch.start_x;
+      int16_t dy = s_touch.last_y - s_touch.start_y;
+      uint32_t dt = time_ms(NULL, NULL) - s_touch.start_ms;
+      bool is_tap = (dx > -TAP_SLOP_PX && dx < TAP_SLOP_PX &&
+                     dy > -TAP_SLOP_PX && dy < TAP_SLOP_PX &&
+                     dt < TAP_MAX_MS);
+      s_touch.phase = TG_IDLE;
+      if (!is_tap) break;
+      // Hit-test the LIFT-OFF coordinate (most touchscreens release within
+      // the original target).  Header / divider / hint = no-op.
+      int16_t y = s_touch.start_y;
+      VolFocus next = s_vol_focus;
+      if (y >= V2_GROUP_Y && y < V2_DIV2_Y) {
+        next = VOL_FOCUS_GROUP;
+      } else if (y >= V2_INDIV_Y && y < V2_HINT_Y) {
+        next = VOL_FOCUS_INDIV;
+      }
+      if (next != s_vol_focus) {
+        s_vol_focus = next;
+        if (s_volume_root_layer) layer_mark_dirty(s_volume_root_layer);
+      }
+      break;
+    }
+  }
+}
+
 static void volume_window_load(Window *w) {
   Layer *root = window_get_root_layer(w);
   s_volume_root_layer = root;
+  // Group always gets focus on open (spec §6.1.2).
+  s_vol_focus = VOL_FOCUS_GROUP;
   layer_set_update_proc(root, volume_root_update);
   window_set_click_config_provider(w, volume_click_config);
+  touch_service_unsubscribe();
+  touch_service_subscribe(touch_volume_handler, NULL);
 }
 static void volume_window_unload(Window *w) {
   s_volume_root_layer = NULL;
+  touch_service_unsubscribe();
+  touch_service_subscribe(touch_now_handler, NULL);
 }
 
 static void volume_window_push(void) {
@@ -1783,6 +2025,20 @@ static void inbox_received(DictionaryIterator *iter, void *ctx) {
     if (s_now_root_layer) layer_mark_dirty(s_now_root_layer);
     return;
   }
+  if (cmd_t && cmd_t->value->int32 == CMD_DEBUG_OPEN_VOL) {
+    // Look at ARG_INT to pick a focus override — 0 = group (default),
+    // 1 = individual.  We mutate s_vol_focus AFTER push so the window
+    // load proc's reset doesn't clobber the test setting.
+    volume_window_push();
+    Tuple *focus_t = dict_find(iter, MESSAGE_KEY_ARG_INT);
+    if (focus_t && focus_t->value->int32 == 1) {
+      s_vol_focus = VOL_FOCUS_INDIV;
+    } else {
+      s_vol_focus = VOL_FOCUS_GROUP;
+    }
+    if (s_volume_root_layer) layer_mark_dirty(s_volume_root_layer);
+    return;
+  }
 
   Tuple *err = dict_find(iter, MESSAGE_KEY_ST_ERROR);
   if (err) {
@@ -1868,6 +2124,14 @@ static void inbox_received(DictionaryIterator *iter, void *ctx) {
   if (t)  s_now.elapsed_s = (uint32_t)t->value->int32;
   t = dict_find(iter, MESSAGE_KEY_ST_DURATION);
   if (t)  s_now.duration_s = (uint32_t)t->value->int32;
+
+  // v1.1 keys — control player id (volume target) + group volume mirror.
+  copy_tuple_str(iter, MESSAGE_KEY_ST_CONTROL_PLAYER_ID,
+                 s_now.control_player_id, MAX_PLAYER_ID);
+  t = dict_find(iter, MESSAGE_KEY_ST_GROUP_VOLUME);
+  if (t)  s_now.group_volume = (int16_t)t->value->int32;
+  t = dict_find(iter, MESSAGE_KEY_ST_GROUP_MUTED);
+  if (t)  s_now.group_muted = t->value->int32 != 0;
 
   if (s_now_root_layer) layer_mark_dirty(s_now_root_layer);
   if (s_volume_root_layer) layer_mark_dirty(s_volume_root_layer);

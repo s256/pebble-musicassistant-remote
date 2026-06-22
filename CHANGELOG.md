@@ -2,6 +2,29 @@
 
 All notable changes to this project follow [Keep a Changelog](https://keepachangelog.com/) and adhere to [Semantic Versioning](https://semver.org/).
 
+## [1.1.0] — 2026-06-22
+
+Three deliverables: a bug fix you reported on the watch, a group-volume control, and Home Assistant authentication.
+
+### Added
+
+- **Two-row volume window for groups.** When the active control player is part of a sync-group, the volume window now shows two rows — group overall on top, this-player only underneath. Tap a row to focus it; the focused row gets a cerulean accent strip and brighter title. Hardware buttons always change the focused row's volume (`UP` / `DOWN` step ±5, `SELECT` toggles mute). Solo players keep the single-row volume window unchanged.
+  - Group writes go via `players/cmd/group_volume` + `players/cmd/group_volume_mute` on the master.
+  - Individual writes go via `players/cmd/volume_set` + `players/cmd/volume_mute` on the chosen player.
+- **Home Assistant authentication.** The settings page now offers a radio between **Music Assistant** (today's username + password) and **Home Assistant** (OAuth via Music Assistant's `homeassistant` provider — only works when MA is running as the HA add-on). Both options are always visible; pick the one that fits your setup.
+  - HA flow: clicking **Sign in with Home Assistant** calls `auth/authorization_url` on MA, redirects the browser to HA, lets MA's server-side `/auth/callback` exchange the code, then bounces back to the settings page with the bearer token ready to use.
+  - Signed-in badge with display name + role + "Sign out" button after either auth path succeeds. Sign out revokes the token server-side (`auth/logout`) and clears the local state.
+  - Token validation on app start via `auth/me`. Builtin mode silently re-auths on 401 using stored credentials. HA mode surfaces "Sign in expired — open Settings" and waits for the user.
+
+### Fixed
+
+- **Selecting a non-master member in the player list now actually controls that member.** Previously, picking Den (synced to Office) snapped the now-playing screen back to Office and you couldn't tweak Den's volume. The phone-side bridge now tracks two separate ids: `activeQueueId` (the master's queue, where playback state lives) and `controlPlayerId` (the user's literal pick, where volume / mute commands go). The now-playing header now shows the chosen member's name.
+
+### Internal
+
+- New AppMessage keys: `ST_CONTROL_PLAYER_ID`, `ST_GROUP_VOLUME`, `ST_GROUP_MUTED`. New commands `CMD_GROUP_VOLUME_UP = 16`, `CMD_GROUP_VOLUME_DOWN = 17`, `CMD_GROUP_MUTE_TOGGLE = 18`. Existing ids unchanged.
+- Settings page schema gains `authMode: "builtin" | "homeassistant"` and `accessToken` / `user` blobs. Backwards compatible with v1.0 settings (defaults to `"builtin"`).
+
 ## [1.0.1] — 2026-06-22
 
 Two grouping bugs reported from real-watch use.
@@ -135,6 +158,7 @@ Performance (iridium review, all post-ship polish; no correctness impact):
 - De-duplicate `menu_layer_set_selected_index()` calls during drag in the player list.
 - Rename / parameterise `clamp32` (it actually clamps to 60).
 
+[1.1.0]: https://github.com/s256/pebble-musicassistant-remote/releases/tag/v1.1.0
 [1.0.1]: https://github.com/s256/pebble-musicassistant-remote/releases/tag/v1.0.1
 [1.0.0]: https://github.com/s256/pebble-musicassistant-remote/releases/tag/v1.0.0
 [0.3.0]: https://github.com/s256/pebble-musicassistant-remote/releases/tag/v1.0.0

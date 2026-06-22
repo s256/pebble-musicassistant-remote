@@ -28,6 +28,9 @@ var CMD = {
   GROUP:           13,
   UNGROUP:         14,
   UNGROUP_ALL:     15,
+  GROUP_VOLUME_UP:    16,
+  GROUP_VOLUME_DOWN:  17,
+  GROUP_MUTE_TOGGLE:  18,
 };
 
 // Row flag bits — must match main.c.
@@ -101,9 +104,31 @@ function http(method, url, body, headers, cb) {
 }
 
 // ─── Auth ─────────────────────────────────────────────────────────────────
+//
+// Two auth modes (set by the settings page, stored in `settings.authMode`):
+//   - "builtin"        — username + password, silent re-auth on 401.
+//   - "homeassistant"  — OAuth flow lives entirely in the settings page;
+//                        on 401 we surface an inline error and stop polling
+//                        until the user reopens settings.
+// `settings.authMode` defaults to "builtin" for backward compatibility with
+// pre-v1.1 saved settings.
 
+function authMode() {
+  return (settings && settings.authMode) || 'builtin';
+}
+
+// builtin-mode silent login.  Re-runs username+password against
+// /auth/login and refreshes the cached token in place.  Errors out
+// without retrying for HA mode — those sessions can only be restarted
+// by the user reopening settings.
 function login(cb) {
-  if (!settings || !settings.host || !settings.username || !settings.password) {
+  if (!settings || !settings.host) {
+    return cb(new Error('Settings not configured'));
+  }
+  if (authMode() === 'homeassistant') {
+    return cb(new Error('Sign in expired — open Settings'));
+  }
+  if (!settings.username || !settings.password) {
     return cb(new Error('Settings not configured'));
   }
   console.log('[ma] login as', settings.username);
@@ -112,14 +137,45 @@ function login(cb) {
     credentials: { username: settings.username, password: settings.password },
   }, null, function (err, status, body) {
     if (err) return cb(err);
-    if (status !== 200 || !body || !body.token) {
+    if (status !== 200 || !body) {
       return cb(new Error('Auth failed (' + status + ')'));
     }
-    token = body.token;
+    // The builtin envelope uses `token`; the HA envelope (handled in the
+    // settings page) uses `access_token`.  We accept either defensively in
+    // case the server normalises one day.
+    var tok = body.token || body.access_token;
+    if (!tok) return cb(new Error('Auth failed (no token in response)'));
+    token = tok;
     saveToken(token);
     console.log('[ma] login ok');
     cb(null);
   });
+}
+
+// Validate the cached token via auth/me.  On success the response is the
+// User record — we cache it on the settings blob so handlers can read it.
+// On failure (most often 401), we report the cause; the caller decides
+// whether to silently re-auth (builtin) or push an error (HA).
+function authMe(cb) {
+  if (!settings || !settings.host || !token) {
+    return cb(new Error('Not authenticated'));
+  }
+  http('POST', settings.host + '/api',
+    { message_id: String(msgId++), command: 'auth/me', args: {} },
+    { Authorization: 'Bearer ' + token },
+    function (err, status, body) {
+      if (err) return cb(err);
+      if (status === 401) return cb(new Error('Token invalid'));
+      if (status < 200 || status >= 300) return cb(new Error('HTTP ' + status));
+      // /api commands return either { result: <User> } or the raw user dict
+      // depending on the MA build.  Both shapes are tolerated.
+      var user = (body && body.result) || body || null;
+      if (user) {
+        settings.user = user;
+        saveSettings(settings);
+      }
+      cb(null, user);
+    });
 }
 
 // ─── MA command envelope ──────────────────────────────────────────────────
@@ -151,27 +207,79 @@ function maCall(command, args, cb) {
 
 // ─── Player selection ─────────────────────────────────────────────────────
 
-// Pick the active player to render on the watch.  Override wins; else
+// Pick the active queue + the control player id.  Override wins; else
 // playing > paused > anything available, alphabetical tiebreak by display_name.
-function pickActiveQueue(queues) {
+//
+// Returns { queue, controlPlayerId }:
+//   - queue:           the PlayerQueue we READ state from (title, artist,
+//                      progress, shuffle, repeat).  When the user has overridden
+//                      to a synced MEMBER, we surface the MASTER's queue here
+//                      because the member's own queue is inactive (members
+//                      share the master's queue server-side).
+//   - controlPlayerId: the player_id we WRITE to (volume / mute / group cmds
+//                      and ST_PLAYER_NAME header readout).  Always the user's
+//                      pick, even when we promoted a master for read state.
+function pickActiveContext(queues, players) {
   if (!queues || queues.length === 0) return null;
-  var avail = queues.filter(function (q) { return q.available && q.active; });
-  if (avail.length === 0) avail = queues.filter(function (q) { return q.available; });
-  if (avail.length === 0) return null;
 
+  var byName = function (a, b) { return a.display_name.localeCompare(b.display_name); };
+  var avail = queues.filter(function (q) { return q.available && q.active; });
+  var availFallback = queues.filter(function (q) { return q.available; });
+
+  // Resolve override.  Two sub-cases:
+  //   1. Override is in `avail` already (solo / master) → use it directly,
+  //      controlPlayerId === queue.queue_id.
+  //   2. Override is a synced member — its own queue is active=false, so we
+  //      look the player up and follow synced_to to the master's queue, but
+  //      keep the member as controlPlayerId.
   if (overridePlayerId) {
-    var ov = avail.find(function (q) { return q.queue_id === overridePlayerId; });
-    if (ov) return ov;
-    // Override stale; drop it.
+    var direct = avail.find(function (q) { return q.queue_id === overridePlayerId; });
+    if (direct) return { queue: direct, controlPlayerId: direct.queue_id };
+
+    var pmap = playersById(players);
+    var memberPlayer = pmap[overridePlayerId];
+    if (memberPlayer && memberPlayer.synced_to) {
+      var masterId = memberPlayer.synced_to;
+      var masterQueue = avail.find(function (q) { return q.queue_id === masterId; })
+                     || availFallback.find(function (q) { return q.queue_id === masterId; });
+      if (masterQueue) return { queue: masterQueue, controlPlayerId: overridePlayerId };
+    }
+
+    // Override is also in availFallback (e.g. master that's available but
+    // inactive) — accept it as-is.
+    var fallbackDirect = availFallback.find(function (q) { return q.queue_id === overridePlayerId; });
+    if (fallbackDirect) return { queue: fallbackDirect, controlPlayerId: overridePlayerId };
+
+    // Override stale; drop it and fall through.
     overridePlayerId = null;
   }
 
-  var byName = function (a, b) { return a.display_name.localeCompare(b.display_name); };
+  if (avail.length === 0) avail = availFallback;
+  if (avail.length === 0) return null;
+
   var playing = avail.filter(function (q) { return q.state === 'playing'; }).sort(byName);
-  if (playing.length) return playing[0];
+  if (playing.length) return { queue: playing[0], controlPlayerId: playing[0].queue_id };
   var paused  = avail.filter(function (q) { return q.state === 'paused' ; }).sort(byName);
-  if (paused.length)  return paused[0];
-  return avail.slice().sort(byName)[0];
+  if (paused.length)  return { queue: paused[0],  controlPlayerId: paused[0].queue_id  };
+  var first = avail.slice().sort(byName)[0];
+  return { queue: first, controlPlayerId: first.queue_id };
+}
+
+// Derive group context for one player.  Returns
+//   { isInGroup, masterId, members } — masterId is null when solo.
+function groupCtxFor(player, players) {
+  if (!player) return { isInGroup: false, masterId: null, members: [] };
+  if (player.synced_to) {
+    // Synced member — master is its synced_to.
+    var pmap = playersById(players);
+    var master = pmap[player.synced_to];
+    var members = (master && Array.isArray(master.group_members)) ? master.group_members : [];
+    return { isInGroup: true, masterId: player.synced_to, members: members };
+  }
+  if (Array.isArray(player.group_members) && player.group_members.length > 0) {
+    return { isInGroup: true, masterId: player.player_id, members: player.group_members };
+  }
+  return { isInGroup: false, masterId: null, members: [] };
 }
 
 function maStateToEnum(s) {
@@ -242,8 +350,8 @@ function clamp32(s) {
   return s.substring(0, 60);
 }
 
-function pushNowPlaying(queue, players) {
-  if (!queue) {
+function pushNowPlaying(ctx, players) {
+  if (!ctx || !ctx.queue) {
     enqueue({
       ST_OK: 1,
       ST_PLAYER_NAME: 'No player',
@@ -254,9 +362,14 @@ function pushNowPlaying(queue, players) {
       ST_VOLUME: 0, ST_MUTED: 0,
       ST_SHUFFLE: 0, ST_REPEAT: REPEAT.off,
       ST_ELAPSED: 0, ST_DURATION: 0,
+      ST_CONTROL_PLAYER_ID: '',
+      ST_GROUP_VOLUME: -1,
+      ST_GROUP_MUTED:  0,
     });
     return;
   }
+  var queue = ctx.queue;
+  var controlPlayerId = ctx.controlPlayerId;
   var item = queue.current_item || {};
   var media = item.media_item || {};
   var title = item.name || media.name || 'Unknown';
@@ -265,33 +378,59 @@ function pushNowPlaying(queue, players) {
   else if (item.artist) artist = item.artist;
   var album = (media.album && media.album.name) || item.album || '';
 
-  // The player record gives us volume / mute.
-  var player = (players || []).find(function (p) { return p.player_id === queue.queue_id; });
-  var volume = player && player.volume_level != null ? player.volume_level : 0;
-  var muted  = player && player.volume_muted ? 1 : 0;
+  // Volume / mute come from the CONTROL player record (the user's pick),
+  // not the master.  The header name also follows controlPlayerId.
+  var pmap = playersById(players);
+  var controlPlayer = pmap[controlPlayerId];
+  var volume = controlPlayer && controlPlayer.volume_level != null ? controlPlayer.volume_level : 0;
+  var muted  = controlPlayer && controlPlayer.volume_muted ? 1 : 0;
+
+  // Header readout — prefer the control player's display_name (= user's pick).
+  // Fall back to the queue's display_name when the player record is missing.
+  var headerName = (controlPlayer && controlPlayer.display_name)
+      || queue.display_name
+      || '';
+
+  // Group context drives the two-row volume window.  Read group volume from
+  // the master player's record (group_volume is mirrored across members but
+  // we trust the source — group commands target the master anyway).
+  var grp = groupCtxFor(controlPlayer, players);
+  var groupVolume = -1;
+  var groupMuted = 0;
+  if (grp.isInGroup && grp.masterId) {
+    var masterPlayer = pmap[grp.masterId];
+    if (masterPlayer && masterPlayer.group_volume != null) {
+      groupVolume = masterPlayer.group_volume;
+      groupMuted  = masterPlayer.group_volume_muted ? 1 : 0;
+    }
+  }
 
   // Signature for dedup.  elapsed_s is deliberately omitted — the watch
-  // interpolates it locally between pushes, so sending it every poll would
-  // defeat the dedup intent.  album IS included since it can change without
-  // title/artist changing on compilation albums.
-  var sig = [queue.queue_id, queue.state, title, artist, album, volume, muted,
-             queue.shuffle_enabled ? 1 : 0, queue.repeat_mode].join('|');
+  // interpolates it locally between pushes.  controlPlayerId, header name,
+  // group volume/muted ARE included so a user switch (override) or a group
+  // volume change pushes through.
+  var sig = [queue.queue_id, controlPlayerId, headerName, queue.state, title, artist, album,
+             volume, muted, queue.shuffle_enabled ? 1 : 0, queue.repeat_mode,
+             groupVolume, groupMuted].join('|');
   if (sig === lastSentSig) return;
   lastSentSig = sig;
 
   enqueue({
     ST_OK: 1,
-    ST_PLAYER_NAME: clamp32(queue.display_name),
-    ST_TITLE:       clamp32(title),
-    ST_ARTIST:      clamp32(artist),
-    ST_ALBUM:       clamp32(album),
-    ST_STATE:       maStateToEnum(queue.state),
-    ST_VOLUME:      volume,
-    ST_MUTED:       muted,
-    ST_SHUFFLE:     queue.shuffle_enabled ? 1 : 0,
-    ST_REPEAT:      REPEAT[queue.repeat_mode] != null ? REPEAT[queue.repeat_mode] : REPEAT.off,
-    ST_ELAPSED:     Math.floor(queue.elapsed_time || 0),
-    ST_DURATION:    Math.floor((item && item.duration) || (media && media.duration) || 0),
+    ST_PLAYER_NAME:       clamp32(headerName),
+    ST_TITLE:             clamp32(title),
+    ST_ARTIST:            clamp32(artist),
+    ST_ALBUM:             clamp32(album),
+    ST_STATE:             maStateToEnum(queue.state),
+    ST_VOLUME:            volume,
+    ST_MUTED:             muted,
+    ST_SHUFFLE:           queue.shuffle_enabled ? 1 : 0,
+    ST_REPEAT:            REPEAT[queue.repeat_mode] != null ? REPEAT[queue.repeat_mode] : REPEAT.off,
+    ST_ELAPSED:           Math.floor(queue.elapsed_time || 0),
+    ST_DURATION:          Math.floor((item && item.duration) || (media && media.duration) || 0),
+    ST_CONTROL_PLAYER_ID: clamp32(controlPlayerId || ''),
+    ST_GROUP_VOLUME:      groupVolume,
+    ST_GROUP_MUTED:       groupMuted,
   });
 }
 
@@ -459,9 +598,9 @@ function pollOnce(cb) {
         return cb && cb(err2);
       }
       var players = (pres && pres.result) || pres || [];
-      var active = pickActiveQueue(queues);
-      pushNowPlaying(active, players);
-      cb && cb(null, queues, players, active);
+      var ctx = pickActiveContext(queues, players);
+      pushNowPlaying(ctx, players);
+      cb && cb(null, queues, players, ctx);
     });
   });
 }
@@ -469,8 +608,9 @@ function pollOnce(cb) {
 function schedulePoll(ms) {
   if (pollTimer) clearTimeout(pollTimer);
   pollTimer = setTimeout(function () {
-    pollOnce(function (err, queues, players, active) {
-      var next = (active && active.state === 'playing') ? POLL_MS_PLAYING : POLL_MS_IDLE;
+    pollOnce(function (err, queues, players, ctx) {
+      var queue = ctx && ctx.queue;
+      var next = (queue && queue.state === 'playing') ? POLL_MS_PLAYING : POLL_MS_IDLE;
       schedulePoll(next);
     });
   }, ms);
@@ -505,19 +645,28 @@ function afterGroupingChange() {
 }
 
 // ─── Active-player resolution for outbound commands ───────────────────────
-
+//
+// Resolves the active read-queue AND the control player id for an outbound
+// command.  Both are forwarded to the callback:
+//
+//   queue     = the PlayerQueue to read state from / target with queue cmds
+//               (play_pause, next, previous, shuffle, repeat, play_media).
+//   controlId = the player_id to target with player cmds (volume_*, *_mute).
+//   player    = the Player record for controlId (gives current volume/mute).
+//   players   = the full /players list (callers that need a master lookup).
 function withActive(cb) {
   maCall('player_queues/all', {}, function (err, qres) {
     if (err) { pushError(err.message); return; }
     var queues = (qres && qres.result) || qres || [];
-    var active = pickActiveQueue(queues);
-    if (!active) { pushError('No active player'); return; }
-    // We also fetch /players to get current volume for ± commands.
+    // We also fetch /players to get current volume for ± commands AND to let
+    // pickActiveContext resolve overridden members via their synced_to.
     maCall('players/all', {}, function (err2, pres) {
       if (err2) { pushError(err2.message); return; }
       var players = (pres && pres.result) || pres || [];
-      var player  = players.find(function (p) { return p.player_id === active.queue_id; });
-      cb(active, player);
+      var ctx = pickActiveContext(queues, players);
+      if (!ctx) { pushError('No active player'); return; }
+      var player = players.find(function (p) { return p.player_id === ctx.controlPlayerId; });
+      cb(ctx.queue, ctx.controlPlayerId, player, players);
     });
   });
 }
@@ -540,8 +689,8 @@ function handleWatchCmd(cmd, payload) {
       break;
 
     case CMD.PLAY_PAUSE:
-      withActive(function (active) {
-        maCall('player_queues/play_pause', { queue_id: active.queue_id }, function (err) {
+      withActive(function (queue) {
+        maCall('player_queues/play_pause', { queue_id: queue.queue_id }, function (err) {
           if (err) pushError(err.message);
           quickRepoll();
         });
@@ -549,8 +698,8 @@ function handleWatchCmd(cmd, payload) {
       break;
 
     case CMD.NEXT:
-      withActive(function (active) {
-        maCall('player_queues/next', { queue_id: active.queue_id }, function (err) {
+      withActive(function (queue) {
+        maCall('player_queues/next', { queue_id: queue.queue_id }, function (err) {
           if (err) pushError(err.message);
           quickRepoll();
         });
@@ -558,8 +707,8 @@ function handleWatchCmd(cmd, payload) {
       break;
 
     case CMD.PREVIOUS:
-      withActive(function (active) {
-        maCall('player_queues/previous', { queue_id: active.queue_id }, function (err) {
+      withActive(function (queue) {
+        maCall('player_queues/previous', { queue_id: queue.queue_id }, function (err) {
           if (err) pushError(err.message);
           quickRepoll();
         });
@@ -568,52 +717,90 @@ function handleWatchCmd(cmd, payload) {
 
     case CMD.VOLUME_UP:
     case CMD.VOLUME_DOWN:
-      withActive(function (active, player) {
+      // Player command — target the CONTROL player (the user's pick), not the
+      // queue.  This is the v1.1 bugfix: when overridden to a synced member,
+      // queue.queue_id is the master, but volume must hit the member.
+      withActive(function (queue, controlId, player) {
         var current = (player && player.volume_level != null) ? player.volume_level : 50;
         var target = current + (cmd === CMD.VOLUME_UP ? VOLUME_STEP : -VOLUME_STEP);
         if (target < 0) target = 0;
         if (target > 100) target = 100;
         maCall('players/cmd/volume_set',
-          { player_id: active.queue_id, volume_level: target },
+          { player_id: controlId, volume_level: target },
           function (err) { if (err) pushError(err.message); quickRepoll(); });
       });
       break;
 
     case CMD.MUTE_TOGGLE:
-      withActive(function (active, player) {
+      withActive(function (queue, controlId, player) {
         var muted = !(player && player.volume_muted);
         maCall('players/cmd/volume_mute',
-          { player_id: active.queue_id, muted: muted },
+          { player_id: controlId, muted: muted },
           function (err) { if (err) pushError(err.message); quickRepoll(); });
       });
       break;
 
     case CMD.SHUFFLE_TOGGLE:
-      withActive(function (active) {
-        // active here is a queue, so shuffle_enabled is on it.
-        var next = !active.shuffle_enabled;
+      withActive(function (queue) {
+        // Queue command — shuffle_enabled is on the queue.
+        var next = !queue.shuffle_enabled;
         maCall('player_queues/shuffle',
-          { queue_id: active.queue_id, shuffle_enabled: next },
+          { queue_id: queue.queue_id, shuffle_enabled: next },
           function (err) { if (err) pushError(err.message); quickRepoll(); });
       });
       break;
 
     case CMD.REPEAT_CYCLE:
-      withActive(function (active) {
-        var cur = active.repeat_mode || 'off';
+      withActive(function (queue) {
+        var cur = queue.repeat_mode || 'off';
         var nextMode = cur === 'off' ? 'all' : cur === 'all' ? 'one' : 'off';
         maCall('player_queues/repeat',
-          { queue_id: active.queue_id, repeat_mode: nextMode },
+          { queue_id: queue.queue_id, repeat_mode: nextMode },
           function (err) { if (err) pushError(err.message); quickRepoll(); });
       });
       break;
 
     case CMD.QUICK_PLAY:
-      withActive(function (active) {
+      withActive(function (queue) {
         var uri = payload.ARG_STR;
         if (!uri) { pushError('Empty quick-play URI'); return; }
         maCall('player_queues/play_media',
-          { queue_id: active.queue_id, media: uri, option: 'replace' },
+          { queue_id: queue.queue_id, media: uri, option: 'replace' },
+          function (err) { if (err) pushError(err.message); quickRepoll(); });
+      });
+      break;
+
+    // ─── Group volume (v1.1) ────────────────────────────────────────────
+    // Targets the MASTER player resolved from the control player's synced_to
+    // (or controlId itself when it's already the master / a non-sync group
+    // master).  group_volume / group_volume_mute commands always take the
+    // master's player_id.
+    case CMD.GROUP_VOLUME_UP:
+    case CMD.GROUP_VOLUME_DOWN:
+      withActive(function (queue, controlId, player, players) {
+        var pmap = playersById(players);
+        var ctrl = pmap[controlId];
+        var masterId = (ctrl && ctrl.synced_to) ? ctrl.synced_to : controlId;
+        var master = pmap[masterId];
+        var current = (master && master.group_volume != null) ? master.group_volume : 50;
+        var target = current + (cmd === CMD.GROUP_VOLUME_UP ? VOLUME_STEP : -VOLUME_STEP);
+        if (target < 0) target = 0;
+        if (target > 100) target = 100;
+        maCall('players/cmd/group_volume',
+          { player_id: masterId, volume_level: target },
+          function (err) { if (err) pushError(err.message); quickRepoll(); });
+      });
+      break;
+
+    case CMD.GROUP_MUTE_TOGGLE:
+      withActive(function (queue, controlId, player, players) {
+        var pmap = playersById(players);
+        var ctrl = pmap[controlId];
+        var masterId = (ctrl && ctrl.synced_to) ? ctrl.synced_to : controlId;
+        var master = pmap[masterId];
+        var current = !!(master && master.group_volume_muted);
+        maCall('players/cmd/group_volume_mute',
+          { player_id: masterId, muted: !current },
           function (err) { if (err) pushError(err.message); quickRepoll(); });
       });
       break;
@@ -676,7 +863,44 @@ Pebble.addEventListener('ready', function () {
     pushError('Configure host in settings');
     return;
   }
-  schedulePoll(POLL_MS_AFTER_ACTION);
+  // Pull the cached HA token (or builtin token) out of settings if the
+  // settings page populated it on its last save.  Token in localStorage
+  // takes precedence for the builtin re-auth path.
+  if (!token && settings.accessToken) {
+    token = settings.accessToken;
+    saveToken(token);
+  }
+  if (token) {
+    // Probe the cached token first.  On success we know the session is
+    // still valid and start polling immediately; otherwise branch on
+    // authMode and either silently re-auth (builtin) or surface a
+    // "Sign in expired" toast (homeassistant).
+    authMe(function (err, user) {
+      if (!err) {
+        console.log('[ma] auth/me ok as', user && (user.display_name || user.username));
+        schedulePoll(POLL_MS_AFTER_ACTION);
+        return;
+      }
+      console.log('[ma] auth/me failed:', err.message);
+      if (authMode() === 'homeassistant') {
+        token = null; saveToken(null);
+        pushError('Sign in expired — open Settings');
+        return;
+      }
+      // builtin — try a silent re-auth.
+      token = null; saveToken(null);
+      login(function (lerr) {
+        if (lerr) {
+          pushError('Sign in expired — open Settings');
+          return;
+        }
+        schedulePoll(POLL_MS_AFTER_ACTION);
+      });
+    });
+  } else {
+    // No cached token — let maCall trigger login on first use.
+    schedulePoll(POLL_MS_AFTER_ACTION);
+  }
 });
 
 Pebble.addEventListener('appmessage', function (e) {
@@ -687,10 +911,14 @@ Pebble.addEventListener('appmessage', function (e) {
 Pebble.addEventListener('showConfiguration', function () {
   var cur = loadSettings() || {};
   var slotsJson = JSON.stringify(Array.isArray(cur.slots) ? cur.slots : []);
-  var qs = 'host='     + encodeURIComponent(cur.host || '')
-         + '&user='    + encodeURIComponent(cur.username || '')
-         + '&hasPass=' + (cur.password ? '1' : '0')
-         + '&slots='   + encodeURIComponent(slotsJson);
+  var userJson = cur.user ? JSON.stringify(cur.user) : '';
+  var qs = 'host='        + encodeURIComponent(cur.host || '')
+         + '&user='       + encodeURIComponent(cur.username || '')
+         + '&hasPass='    + (cur.password ? '1' : '0')
+         + '&slots='      + encodeURIComponent(slotsJson)
+         + '&authMode='   + encodeURIComponent(cur.authMode || 'builtin')
+         + '&hasToken='   + (cur.accessToken ? '1' : '0')
+         + '&userBlob='   + encodeURIComponent(userJson);
   Pebble.openURL(CONFIG_URL + '?' + qs);
 });
 
@@ -712,16 +940,28 @@ Pebble.addEventListener('webviewclosed', function (e) {
         uri:   clampStr(String(s.uri), MAX_QUICK_URI),
       };
     });
+  var mode = (next.authMode === 'homeassistant') ? 'homeassistant' : 'builtin';
   var merged = {
-    host:     (next.host || '').replace(/\/+$/, ''),
-    username:  next.username || '',
-    password:  next.password || prev.password || '',
-    slots:     slots,
+    host:        (next.host || '').replace(/\/+$/, ''),
+    username:    next.username || '',
+    password:    next.password || prev.password || '',
+    slots:       slots,
+    authMode:    mode,
+    accessToken: next.accessToken || null,
+    user:        next.user || null,
   };
   saveSettings(merged);
   settings = merged;
-  saveToken(null); token = null;
+  // Token rotation: if the page handed us a fresh token (either builtin
+  // re-auth or a completed HA OAuth roundtrip), adopt it; otherwise clear
+  // the cached one so the next maCall triggers a fresh login flow.
+  if (merged.accessToken) {
+    token = merged.accessToken;
+    saveToken(token);
+  } else {
+    saveToken(null); token = null;
+  }
   pushQuickSlots();
-  console.log('[ma] settings saved (' + slots.length + ' quick slots)');
+  console.log('[ma] settings saved (' + slots.length + ' quick slots, mode=' + mode + ')');
   schedulePoll(POLL_MS_AFTER_ACTION);
 });
