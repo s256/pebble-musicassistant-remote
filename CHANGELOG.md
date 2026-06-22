@@ -2,6 +2,40 @@
 
 All notable changes to this project follow [Keep a Changelog](https://keepachangelog.com/) and adhere to [Semantic Versioning](https://semver.org/).
 
+## [1.0.0] — 2026-06-22
+
+First stable release. Feature-complete for the v1 remit; the watchapp is daily-driver ready.
+
+### Added
+
+- **Menu launcher icon** — a 25 × 25 native-PNG speaker silhouette + sound waves, distinct from Pebble Music's note glyph and `pebble-ma`'s cassette. Embedded in the `.pbw` as a `menuIcon` published-media resource.
+- **Multi-room grouping** (was 0.3.0):
+  - Players list now renders group topology — master rows carry a `⛓ N` chain badge, members render indented under their master with a `↳ synced` subtitle, solo rows are unchanged.
+  - Long-press a row (or `SELECT` long-press) opens an action sheet:
+    - Solo player → "Join / Group with" rows for every compatible other player.
+    - Group member → `⏏ Leave group`, `＋ Add to this group`, `⚠ Ungroup all`.
+  - New AppMessage keys: `ARG_TARGET_PLAYER_ID`, `ARG_PLAYER_IDS`, `PLAYER_ROW_SYNCED_TO`, `PLAYER_ROW_GROUP_COUNT`, `PLAYER_ROW_FLAGS`. New commands `CMD_GROUP`, `CMD_UNGROUP`, `CMD_UNGROUP_ALL` → `players/cmd/group` · `players/cmd/ungroup` · `players/cmd/ungroup_many`.
+
+### Fixed
+
+- **Unicode rendering on the watch** — track names containing smart quotes (`’`), em-dashes (`—`), unicode hyphens (`‐`), ellipses (`…`) and similar punctuation were rendering as tofu boxes because Pebble's bundled Gothic fonts only cover ASCII + Latin-1. The phone-side bridge now transliterates the common punctuation Unicode block to ASCII equivalents before sending strings to the watch, and falls back to `?` for anything else outside Latin-1.
+- **Blank-screen / watchdog kill after extended inactivity** — the 1 Hz interpolation tick was holding the app awake during screen-off, eventually tripping the system watchdog and killing the app silently. Now gated by `app_focus_service` (paused when the screen blanks) and by window `.appear` / `.disappear` (paused when a sub-window is on top of now-playing).
+
+### Repo hygiene
+
+- **`scripts/make-publish-pbw.sh`** — strips the bundled JS source map from the build output for upload. The source map embeds the SDK install path of whoever built the artifact (i.e. a username); the map isn't needed at runtime. The release asset name is `pebble-musicassistant-publish.pbw`.
+- **CONCEPT.md and HANDOFF.md** kept untracked (already excluded in `.gitignore`).
+
+### Stubbed for a future release
+
+- `＋ Add to this group` in the group action sheet currently logs and pops — it needs a sub-sheet drilling into ungrouped candidates that calls `players/cmd/set_members`. Captured in `src/c/main.c` next to the call site.
+
+## [0.3.0] — 2026-06-22
+
+Working draft toward the v1 grouping feature. Folded into `1.0.0` for the first stable release — same code, just an additional version stamp during development. See above.
+
+
+
 ## [0.2.0] — 2026-06-22
 
 UX rebuild around Pebble idiom + Quick Play shortcuts.
@@ -92,6 +126,8 @@ Performance (iridium review, all post-ship polish; no correctness impact):
 - De-duplicate `menu_layer_set_selected_index()` calls during drag in the player list.
 - Rename / parameterise `clamp32` (it actually clamps to 60).
 
+[1.0.0]: https://github.com/s256/pebble-musicassistant-remote/releases/tag/v1.0.0
+[0.3.0]: https://github.com/s256/pebble-musicassistant-remote/releases/tag/v1.0.0
 [0.2.0]: https://github.com/s256/pebble-musicassistant-remote/releases/tag/v0.2.0
 [0.1.1]: https://github.com/s256/pebble-musicassistant-remote/releases/tag/v0.1.1
 [0.1.0]: https://github.com/s256/pebble-musicassistant-remote/releases/tag/v0.1.0

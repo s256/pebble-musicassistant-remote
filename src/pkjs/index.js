@@ -25,7 +25,14 @@ var CMD = {
   SHUFFLE_TOGGLE:  10,
   REPEAT_CYCLE:    11,
   QUICK_PLAY:      12,
+  GROUP:           13,
+  UNGROUP:         14,
+  UNGROUP_ALL:     15,
 };
+
+// Row flag bits — must match main.c.
+var ROW_FLAG_MASTER = 0x01;
+var ROW_FLAG_MEMBER = 0x02;
 
 var MAX_QUICK_SLOTS = 10;
 var MAX_QUICK_LABEL = 40;
@@ -192,8 +199,45 @@ function pump() {
     });
 }
 
-function clamp32(s) {
+// Pebble's bundled Gothic fonts cover ASCII + Latin-1 supplement only.
+// Anything outside that range — smart quotes (U+2018/2019), em-dash (U+2014),
+// hyphen-minus alternatives (U+2010/2011), ellipsis (U+2026), CJK, etc. —
+// renders as a tofu rectangle on-watch.  We map the common offenders to ASCII
+// equivalents and fall back to '?' for everything else above Latin-1.
+//
+// Apply to EVERY string we send to the watch before clamping.
+var PUNCT_MAP = {
+  '‘': "'", '’': "'", '‚': "'", '‛': "'",  // ‘ ’ ‚ ‛
+  '“': '"', '”': '"', '„': '"', '‟': '"',  // “ ” „ ‟
+  '‐': '-', '‑': '-', '‒': '-', '–': '-', '—': '-', '―': '-',  // ‐ ‑ ‒ – — ―
+  '…': '...', '•': '*',                              // … •
+  ' ': ' ', ' ': ' ', ' ': ' ', ' ': ' ',  // various spaces
+  '«': '"', '»': '"',                                // « »
+  '′': "'", '″': '"',                                // ′ ″
+  '​': '',  '‌': '',  '‍': '',  '﻿': '',   // zero-width
+};
+
+function pebbleSafe(s) {
   if (!s) return '';
+  var out = '';
+  for (var i = 0; i < s.length; i++) {
+    var c = s.charAt(i);
+    var code = s.charCodeAt(i);
+    if (code < 0x80) {
+      out += c;                       // ASCII passes through unchanged
+    } else if (PUNCT_MAP[c] != null) {
+      out += PUNCT_MAP[c];            // known punctuation transliteration
+    } else if (code < 0x100) {
+      out += c;                       // Latin-1 supplement (à, ñ, ü, etc.)
+    } else {
+      out += '?';                     // everything else — keep the slot but mark unrenderable
+    }
+  }
+  return out;
+}
+
+function clamp32(s) {
+  s = pebbleSafe(s);
   if (s.length <= 60) return s;
   return s.substring(0, 60);
 }
@@ -251,20 +295,51 @@ function pushNowPlaying(queue, players) {
   });
 }
 
-function pushPlayerList(queues) {
+// Build a quick lookup from player_id -> player record for group derivation.
+function playersById(players) {
+  var map = {};
+  (players || []).forEach(function (p) { if (p && p.player_id) map[p.player_id] = p; });
+  return map;
+}
+
+// Derive grouping state for one player.  Returns { syncedTo, groupCount, flags }.
+//   - master:  group_members.length > 0 AND NOT itself synced to anyone
+//   - member:  synced_to is set
+//   - solo:    neither
+function deriveGroupState(player) {
+  if (!player) return { syncedTo: '', groupCount: 0, flags: 0 };
+  var syncedTo = player.synced_to || '';
+  var members  = Array.isArray(player.group_members) ? player.group_members : [];
+  var isMember = !!syncedTo;
+  var isMaster = !isMember && members.length > 0;
+  var flags = (isMaster ? ROW_FLAG_MASTER : 0) | (isMember ? ROW_FLAG_MEMBER : 0);
+  return {
+    syncedTo:   syncedTo,
+    groupCount: isMaster ? members.length : 0,
+    flags:      flags,
+  };
+}
+
+function pushPlayerList(queues, players) {
   // Sort alphabetically by display_name — same rule as the auto-picker.
   var list = (queues || []).slice()
     .filter(function (q) { return q.available; })
     .sort(function (a, b) { return a.display_name.localeCompare(b.display_name); })
     .slice(0, 16);
 
+  var pmap = playersById(players);
+
   enqueue({ PLAYERS_BEGIN: 1 });
   list.forEach(function (q, i) {
+    var grp = deriveGroupState(pmap[q.queue_id]);
     enqueue({
-      PLAYER_ROW_INDEX: i,
-      PLAYER_ROW_ID:    q.queue_id,
-      PLAYER_ROW_NAME:  clamp32(q.display_name),
-      PLAYER_ROW_STATE: maStateToEnum(q.state),
+      PLAYER_ROW_INDEX:       i,
+      PLAYER_ROW_ID:          q.queue_id,
+      PLAYER_ROW_NAME:        clamp32(q.display_name),
+      PLAYER_ROW_STATE:       maStateToEnum(q.state),
+      PLAYER_ROW_SYNCED_TO:   clamp32(grp.syncedTo),
+      PLAYER_ROW_GROUP_COUNT: grp.groupCount,
+      PLAYER_ROW_FLAGS:       grp.flags,
     });
   });
   enqueue({ PLAYERS_END: 1 });
@@ -276,7 +351,7 @@ function pushError(msg) {
 }
 
 function clampStr(s, n) {
-  if (!s) return '';
+  s = pebbleSafe(s);
   if (s.length <= n) return s;
   return s.substring(0, n);
 }
@@ -363,7 +438,11 @@ function handleWatchCmd(cmd, payload) {
       maCall('player_queues/all', {}, function (err, qres) {
         if (err) { pushError(err.message); return; }
         var queues = (qres && qres.result) || qres || [];
-        pushPlayerList(queues);
+        maCall('players/all', {}, function (perr, pres) {
+          if (perr) { pushError(perr.message); return; }
+          var players = (pres && pres.result) || pres || [];
+          pushPlayerList(queues, players);
+        });
       });
       break;
 
@@ -451,6 +530,35 @@ function handleWatchCmd(cmd, payload) {
           function (err) { if (err) pushError(err.message); quickRepoll(); });
       });
       break;
+
+    case CMD.GROUP: {
+      var src = payload.ARG_PLAYER_ID;
+      var tgt = payload.ARG_TARGET_PLAYER_ID;
+      if (!src || !tgt) { pushError('Group: missing player ids'); break; }
+      maCall('players/cmd/group',
+        { player_id: src, target_player: tgt },
+        function (err) { if (err) pushError(err.message); quickRepoll(); });
+      break;
+    }
+
+    case CMD.UNGROUP: {
+      var pid = payload.ARG_PLAYER_ID;
+      if (!pid) { pushError('Ungroup: missing player id'); break; }
+      maCall('players/cmd/ungroup',
+        { player_id: pid },
+        function (err) { if (err) pushError(err.message); quickRepoll(); });
+      break;
+    }
+
+    case CMD.UNGROUP_ALL: {
+      var idsCsv = payload.ARG_PLAYER_IDS || '';
+      var ids = idsCsv.split(',').filter(function (s) { return s.length > 0; });
+      if (ids.length === 0) { pushError('Ungroup all: empty id list'); break; }
+      maCall('players/cmd/ungroup_many',
+        { player_ids: ids },
+        function (err) { if (err) pushError(err.message); quickRepoll(); });
+      break;
+    }
 
     default:
       console.log('[ma] unknown cmd', cmd);

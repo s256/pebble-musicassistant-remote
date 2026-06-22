@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Menu icon for pebble-musicassistant-remote.
+
+  Pebble launcher icons on Time-series watches are 25x25 single-colour
+  silhouettes; the launcher tints them with the system accent.  Anything
+  non-transparent is drawn; everything else is the slot background.
+
+  Design: speaker cone + three radiating sound waves.  Reads as
+  "audio output" without copying Pebble Music's note glyph or
+  pebble-ma's cassette.
+
+  Rendered as a tall canvas (250x250) so antialiasing on the final 25x25
+  raster is clean; ImageMagick then downsamples + thresholds to 1-bit.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 250 250" width="250" height="250">
+  <g fill="#000000" stroke="#000000" stroke-linecap="round" stroke-linejoin="round">
+    <!-- Speaker cabinet (small rounded rect on the left) -->
+    <rect x="40" y="100" width="38" height="50" rx="6" ry="6"/>
+
+    <!-- Speaker cone (triangular flare opening up & right) -->
+    <polygon points="78,108 78,142 130,180 130,70"/>
+
+    <!-- Three sound waves radiating to the right.  Stroked arcs draw as
+         filled rings; thickness scaled so they survive the 10:1 downsample. -->
+    <path d="M 150,80  Q 175,125 150,170" fill="none" stroke-width="14"/>
+    <path d="M 175,55  Q 215,125 175,195" fill="none" stroke-width="14"/>
+    <path d="M 200,30  Q 255,125 200,220" fill="none" stroke-width="14"/>
+  </g>
+</svg>

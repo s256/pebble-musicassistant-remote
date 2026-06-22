@@ -1,5 +1,5 @@
 /*
- * pebble-musicassistant-remote — v0.2.0
+ * pebble-musicassistant-remote — v0.3.0
  *
  * Native Pebble Time 2 (emery) watchapp. All Music Assistant traffic happens
  * on the phone (src/pkjs/index.js); we just render state and forward user
@@ -96,6 +96,10 @@ typedef enum {
 #define MAX_PLAYERS     16
 #define MAX_PLAYER_ID   48
 
+// Row flag bits — must match index.js ROW_FLAG_*.
+#define ROW_FLAG_MASTER 0x01
+#define ROW_FLAG_MEMBER 0x02
+
 #define MAX_QUICK_SLOTS  10
 #define MAX_QUICK_LABEL  41
 #define MAX_QUICK_URI    121
@@ -108,6 +112,9 @@ typedef struct {
   char          id[MAX_PLAYER_ID];
   char          name[MAX_PLAYER_NAME];
   PlaybackState state;
+  char          synced_to[MAX_PLAYER_ID]; // master player_id, "" if not synced
+  uint8_t       group_count;              // members in our group (0 if not master)
+  uint8_t       flags;                    // ROW_FLAG_* bitmask
 } PlayerRow;
 
 typedef struct {
@@ -160,6 +167,11 @@ enum {
   CMD_SHUFFLE_TOGGLE  = 10,
   CMD_REPEAT_CYCLE    = 11,
   CMD_QUICK_PLAY      = 12,
+  CMD_GROUP           = 13,
+  CMD_UNGROUP         = 14,
+  CMD_UNGROUP_ALL     = 15,
+  // Emulator-only: populate s_players with a canonical mock group setup.
+  CMD_DEBUG_SEED      = 99,
 };
 
 // ─── Windows ──────────────────────────────────────────────────────────────
@@ -172,6 +184,18 @@ static Window     *s_volume_window;
 static Layer      *s_volume_root_layer;
 static Window     *s_quick_window;
 static MenuLayer  *s_quick_menu;
+static Window     *s_groupsheet_window;
+static MenuLayer  *s_groupsheet_menu;
+
+// The player the action sheet operates on — captured at long-press time.
+// Index into s_players[]; -1 = no sheet open.
+static int        s_groupsheet_target = -1;
+
+// Long-press detection for the players list — tracks finger position so we can
+// resolve the row under the finger at fire time.
+#define LONG_PRESS_MS  500
+static AppTimer  *s_pl_long_timer;
+static int16_t   s_pl_long_x, s_pl_long_y;
 
 // ─── Icon drawing (native primitives) ─────────────────────────────────────
 
@@ -279,6 +303,77 @@ static void icon_chevron_right(GContext *ctx, GRect rect, GColor col) {
   graphics_draw_line(ctx, GPoint(cx + 2, cy),     GPoint(cx - 3, cy + 5));
 }
 
+// Two linked rounded rects — used as the "group" glyph in the chain badge.
+// Width 12 px, height 8 px centred in `rect`.
+static void icon_chain(GContext *ctx, GRect rect, GColor col) {
+  graphics_context_set_stroke_color(ctx, col);
+  graphics_context_set_stroke_width(ctx, 1);
+  int cx = rect.origin.x + rect.size.w / 2;
+  int cy = rect.origin.y + rect.size.h / 2;
+  // Left ring at cx-4, right ring at cx+1; they overlap in the middle by 2 px.
+  graphics_draw_round_rect(ctx, GRect(cx - 7, cy - 3, 8, 6), 2);
+  graphics_draw_round_rect(ctx, GRect(cx - 1, cy - 3, 8, 6), 2);
+}
+
+// Eject: an upward triangle with a horizontal bar underneath.
+static void icon_eject(GContext *ctx, GRect rect, GColor col) {
+  graphics_context_set_fill_color(ctx, col);
+  int cx = rect.origin.x + rect.size.w / 2;
+  int cy = rect.origin.y + rect.size.h / 2;
+  fill_triangle(ctx,
+                GPoint(cx - 6, cy + 1),
+                GPoint(cx + 6, cy + 1),
+                GPoint(cx,     cy - 7));
+  graphics_fill_rect(ctx, GRect(cx - 6, cy + 4, 12, 3), 1, GCornersAll);
+}
+
+// Warning: upward triangle outline with a vertical bar inside.  Drawn filled
+// since Pebble's outlined polygon support is limited.
+static void icon_warning(GContext *ctx, GRect rect, GColor col) {
+  graphics_context_set_fill_color(ctx, col);
+  int cx = rect.origin.x + rect.size.w / 2;
+  int cy = rect.origin.y + rect.size.h / 2;
+  fill_triangle(ctx,
+                GPoint(cx - 8, cy + 7),
+                GPoint(cx + 8, cy + 7),
+                GPoint(cx,     cy - 7));
+  // Cut out an inner triangle to make a hollow ring effect.
+  graphics_context_set_fill_color(ctx, GColorBlack);
+  fill_triangle(ctx,
+                GPoint(cx - 5, cy + 5),
+                GPoint(cx + 5, cy + 5),
+                GPoint(cx,     cy - 3));
+  // Exclamation bar + dot, in the warn colour.
+  graphics_context_set_fill_color(ctx, col);
+  graphics_fill_rect(ctx, GRect(cx - 1, cy - 2, 2, 5), 0, GCornerNone);
+  graphics_fill_rect(ctx, GRect(cx - 1, cy + 4, 2, 2), 0, GCornerNone);
+}
+
+// Plus: two crossed filled bars (a thick "+" sign).
+static void icon_plus(GContext *ctx, GRect rect, GColor col) {
+  graphics_context_set_fill_color(ctx, col);
+  int cx = rect.origin.x + rect.size.w / 2;
+  int cy = rect.origin.y + rect.size.h / 2;
+  graphics_fill_rect(ctx, GRect(cx - 6, cy - 1, 12, 3), 0, GCornerNone);
+  graphics_fill_rect(ctx, GRect(cx - 1, cy - 6, 3, 12), 0, GCornerNone);
+}
+
+// Down-right arrow ("↳") drawn as two thin strokes.  Used in the "synced"
+// subtitle on member rows.
+static void icon_subarrow(GContext *ctx, GRect rect, GColor col) {
+  graphics_context_set_stroke_color(ctx, col);
+  graphics_context_set_stroke_width(ctx, 1);
+  int x = rect.origin.x;
+  int y = rect.origin.y + rect.size.h / 2;
+  graphics_draw_line(ctx, GPoint(x,     y - 4), GPoint(x,     y + 2));
+  graphics_draw_line(ctx, GPoint(x,     y + 2), GPoint(x + 6, y + 2));
+  graphics_context_set_fill_color(ctx, col);
+  fill_triangle(ctx,
+                GPoint(x + 6, y),
+                GPoint(x + 6, y + 4),
+                GPoint(x + 9, y + 2));
+}
+
 // ─── AppMessage out helpers ──────────────────────────────────────────────
 
 static void send_simple_cmd(uint8_t cmd) {
@@ -303,6 +398,31 @@ static void send_quick_play(const char *uri) {
   if (app_message_outbox_begin(&iter) != APP_MSG_OK) return;
   dict_write_uint8(iter, MESSAGE_KEY_CMD, CMD_QUICK_PLAY);
   dict_write_cstring(iter, MESSAGE_KEY_ARG_STR, uri);
+  app_message_outbox_send();
+}
+
+static void send_group(const char *src_id, const char *target_id) {
+  DictionaryIterator *iter;
+  if (app_message_outbox_begin(&iter) != APP_MSG_OK) return;
+  dict_write_uint8(iter, MESSAGE_KEY_CMD, CMD_GROUP);
+  dict_write_cstring(iter, MESSAGE_KEY_ARG_PLAYER_ID, src_id);
+  dict_write_cstring(iter, MESSAGE_KEY_ARG_TARGET_PLAYER_ID, target_id);
+  app_message_outbox_send();
+}
+
+static void send_ungroup(const char *player_id) {
+  DictionaryIterator *iter;
+  if (app_message_outbox_begin(&iter) != APP_MSG_OK) return;
+  dict_write_uint8(iter, MESSAGE_KEY_CMD, CMD_UNGROUP);
+  dict_write_cstring(iter, MESSAGE_KEY_ARG_PLAYER_ID, player_id);
+  app_message_outbox_send();
+}
+
+static void send_ungroup_all(const char *csv_ids) {
+  DictionaryIterator *iter;
+  if (app_message_outbox_begin(&iter) != APP_MSG_OK) return;
+  dict_write_uint8(iter, MESSAGE_KEY_CMD, CMD_UNGROUP_ALL);
+  dict_write_cstring(iter, MESSAGE_KEY_ARG_PLAYER_IDS, csv_ids);
   app_message_outbox_send();
 }
 
@@ -611,10 +731,21 @@ static void now_click_config(void *ctx) {
 }
 
 // ─── Local interpolation tick ─────────────────────────────────────────────
+//
+// Bumps elapsed_s once per second while the watch is awake AND we have a
+// playing track AND the now-playing window is visible.  We MUST stop ticking
+// when the app loses focus (screen-off, notification overlay, sub-window
+// pushed onto our stack) — otherwise a runaway 1 Hz redraw during display-off
+// trips the system watchdog and the app gets killed silently.  Re-arm when
+// focus returns via app_focus_service.
+
+static bool s_app_focused = true;
+static bool s_now_visible = true;
 
 static void schedule_tick(void);
 static void tick_cb(void *ctx) {
   s_tick_timer = NULL;
+  if (!s_app_focused || !s_now_visible) return;     // settle while idle
   if (s_now.state == PS_PLAYING && s_now.elapsed_s < s_now.duration_s) {
     s_now.elapsed_s++;
     if (s_now_root_layer) layer_mark_dirty(s_now_root_layer);
@@ -623,7 +754,17 @@ static void tick_cb(void *ctx) {
 }
 static void schedule_tick(void) {
   if (s_tick_timer) return;
+  if (!s_app_focused || !s_now_visible) return;     // don't even arm if hidden
   s_tick_timer = app_timer_register(TICK_MS, tick_cb, NULL);
+}
+static void cancel_tick(void) {
+  if (s_tick_timer) { app_timer_cancel(s_tick_timer); s_tick_timer = NULL; }
+}
+
+static void app_focus_handler(bool in_focus) {
+  s_app_focused = in_focus;
+  if (in_focus) schedule_tick();
+  else          cancel_tick();
 }
 
 // ─── Player list window ───────────────────────────────────────────────────
@@ -646,8 +787,8 @@ static void pl_draw_sep(GContext *ctx, const Layer *cell, MenuIndex *idx, void *
 
 // Custom row drawing — clear two-line layout with explicit padding, a
 // coloured state dot on the left, and ample gap between title and subtitle
-// so nothing overlaps.  Restored from v0.1.1 (the menu_cell_basic_draw
-// shortcut that crept back in lost the dot + spacing).
+// so nothing overlaps.  v0.3.0: master rows get a chain badge on the right,
+// member rows get a left rail + indent + "synced" subtitle.
 static void pl_draw_row(GContext *ctx, const Layer *cell, MenuIndex *idx, void *c) {
   GRect b = layer_get_bounds(cell);
   bool hi = menu_cell_layer_is_highlighted(cell);
@@ -666,32 +807,84 @@ static void pl_draw_row(GContext *ctx, const Layer *cell, MenuIndex *idx, void *
   }
 
   const PlayerRow *p = &s_players[idx->row];
+  bool is_master = (p->flags & ROW_FLAG_MASTER) != 0;
+  bool is_member = (p->flags & ROW_FLAG_MEMBER) != 0;
+
+  // Member rows: 2-px vertical rail down the left edge, indent dot 18 px.
+  int dot_cx     = b.origin.x + 14;
+  int dot_r      = 5;
+  int text_x     = b.origin.x + 28;
+  int text_w_pad = 40;  // room for chain badge on master rows
+  if (is_member) {
+    graphics_context_set_stroke_color(ctx, hi ? GColorWhite : GColorDarkGray);
+    graphics_context_set_stroke_width(ctx, 2);
+    graphics_draw_line(ctx, GPoint(b.origin.x + 14, b.origin.y),
+                            GPoint(b.origin.x + 14, b.origin.y + PL_ROW_H));
+    dot_cx = b.origin.x + 32;
+    dot_r  = 4;
+    text_x = b.origin.x + 46;
+    text_w_pad = 56;
+  }
 
   // Left dot: green = playing, amber = paused, grey = idle.
   GColor dot =
       p->state == PS_PLAYING ? GColorIslamicGreen :
       p->state == PS_PAUSED  ? GColorChromeYellow : GColorDarkGray;
   graphics_context_set_fill_color(ctx, dot);
-  graphics_fill_circle(ctx, GPoint(b.origin.x + 14, b.origin.y + PL_ROW_H / 2), 5);
+  graphics_fill_circle(ctx, GPoint(dot_cx, b.origin.y + PL_ROW_H / 2), dot_r);
 
-  // Name — always white on the row background (was black-on-black in the
-  // regressed version), or white on the cerulean highlight.
+  // Name — always white on the row background, or white on the cerulean highlight.
+  // Member rows use the slightly smaller 16-bold to match the mock.
+  const char *name_font = is_member ? FONT_KEY_GOTHIC_18 : FONT_KEY_GOTHIC_18_BOLD;
   graphics_context_set_text_color(ctx, GColorWhite);
   graphics_draw_text(ctx, p->name,
-                     fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
-                     GRect(b.origin.x + 28, b.origin.y + 4, b.size.w - 40, 24),
+                     fonts_get_system_font(name_font),
+                     GRect(text_x, b.origin.y + 4, b.size.w - text_w_pad, 24),
                      GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
 
-  // Subtitle: playback state, dim grey when inactive, near-white when highlighted.
-  const char *sub =
-      p->state == PS_PLAYING ? "Playing" :
-      p->state == PS_PAUSED  ? "Paused"  :
-      p->state == PS_IDLE    ? "Idle"    : "—";
-  graphics_context_set_text_color(ctx, hi ? GColorPastelYellow : GColorLightGray);
-  graphics_draw_text(ctx, sub,
-                     fonts_get_system_font(FONT_KEY_GOTHIC_14),
-                     GRect(b.origin.x + 28, b.origin.y + 24, b.size.w - 40, 18),
-                     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
+  // Subtitle.  Member rows get "↳ synced" rendered with the native subarrow.
+  if (is_member) {
+    icon_subarrow(ctx, GRect(text_x, b.origin.y + 22, 12, 14),
+                  hi ? GColorPastelYellow : GColorLightGray);
+    graphics_context_set_text_color(ctx, hi ? GColorPastelYellow : GColorLightGray);
+    graphics_draw_text(ctx, "synced",
+                       fonts_get_system_font(FONT_KEY_GOTHIC_14),
+                       GRect(text_x + 14, b.origin.y + 24, b.size.w - text_w_pad - 14, 18),
+                       GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
+  } else {
+    const char *sub =
+        is_master              ? (p->state == PS_PLAYING ? "Playing - group" :
+                                  p->state == PS_PAUSED  ? "Paused - group"  :
+                                                           "Idle - group")
+      : p->state == PS_PLAYING ? "Playing"
+      : p->state == PS_PAUSED  ? "Paused"
+      : p->state == PS_IDLE    ? "Idle"
+      :                          "-";
+    graphics_context_set_text_color(ctx, hi ? GColorPastelYellow : GColorLightGray);
+    graphics_draw_text(ctx, sub,
+                       fonts_get_system_font(FONT_KEY_GOTHIC_14),
+                       GRect(text_x, b.origin.y + 24, b.size.w - text_w_pad, 18),
+                       GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
+  }
+
+  // Master rows get a chain badge on the right.  Tiny outlined rounded-rect
+  // with the chain glyph + member count inside.
+  if (is_master && p->group_count > 0) {
+    GRect badge = GRect(b.origin.x + b.size.w - 38, b.origin.y + 10, 32, 16);
+    graphics_context_set_fill_color(ctx, hi ? GColorOxfordBlue : GColorOxfordBlue);
+    graphics_fill_rect(ctx, badge, 4, GCornersAll);
+    graphics_context_set_stroke_color(ctx, GColorWhite);
+    graphics_context_set_stroke_width(ctx, 1);
+    graphics_draw_round_rect(ctx, badge, 4);
+    icon_chain(ctx, GRect(badge.origin.x + 2, badge.origin.y + 4, 12, 8), GColorWhite);
+    char count_buf[6];
+    snprintf(count_buf, sizeof(count_buf), "%u", (unsigned)p->group_count);
+    graphics_context_set_text_color(ctx, GColorWhite);
+    graphics_draw_text(ctx, count_buf,
+                       fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD),
+                       GRect(badge.origin.x + 16, badge.origin.y - 1, 14, 16),
+                       GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
+  }
 }
 
 static void pl_select(MenuLayer *ml, MenuIndex *idx, void *c) {
@@ -702,31 +895,111 @@ static void pl_select(MenuLayer *ml, MenuIndex *idx, void *c) {
   window_stack_pop(true);
 }
 
-static void touch_players_handler(const TouchEvent *e, void *ctx) {
-  if (!s_players_menu || s_players_count == 0) return;
-  int row = e->y / (PL_ROW_H + 1);   // include the 1-px separator
+// Forward decl — implemented after groupsheet_window below.
+static void groupsheet_window_push(int target_idx);
+
+// Compute the row index from a finger Y coordinate, with the y-pitch math
+// unchanged from v0.2.0 (44 px + 1 px separator).
+static int pl_row_from_y(int16_t y) {
+  int row = y / (PL_ROW_H + 1);
   if (row < 0) row = 0;
   if (row >= s_players_count) row = s_players_count - 1;
+  return row;
+}
 
-  if (e->type == TouchEvent_Touchdown || e->type == TouchEvent_PositionUpdate) {
+// Fired by AppTimer after LONG_PRESS_MS if the finger hasn't moved outside
+// TAP_SLOP_PX and hasn't lifted.  Opens the action sheet on the row currently
+// under the finger.
+static void pl_long_press_fire(void *ctx) {
+  s_pl_long_timer = NULL;
+  if (!s_players_menu || s_players_count == 0) return;
+  int row = pl_row_from_y(s_pl_long_y);
+  LOGI("long-press touch -> row %d (%s)", row, s_players[row].name);
+  // Cancel the in-flight tap so liftoff doesn't also fire pl_select.
+  s_touch.phase = TG_IDLE;
+  groupsheet_window_push(row);
+}
+
+static void pl_cancel_long_press(void) {
+  if (s_pl_long_timer) { app_timer_cancel(s_pl_long_timer); s_pl_long_timer = NULL; }
+}
+
+static void touch_players_handler(const TouchEvent *e, void *ctx) {
+  if (!s_players_menu || s_players_count == 0) return;
+  int row = pl_row_from_y(e->y);
+
+  if (e->type == TouchEvent_Touchdown) {
+    s_touch.phase    = TG_TRACKING;
+    s_touch.start_x  = e->x;
+    s_touch.start_y  = e->y;
+    s_touch.last_x   = e->x;
+    s_touch.last_y   = e->y;
+    s_touch.start_ms = time_ms(NULL, NULL);
+    s_pl_long_x = e->x; s_pl_long_y = e->y;
+    pl_cancel_long_press();
+    s_pl_long_timer = app_timer_register(LONG_PRESS_MS, pl_long_press_fire, NULL);
+    MenuIndex idx = { 0, (uint16_t)row };
+    menu_layer_set_selected_index(s_players_menu, idx, MenuRowAlignCenter, false);
+  } else if (e->type == TouchEvent_PositionUpdate) {
+    s_touch.last_x = e->x; s_touch.last_y = e->y;
+    s_pl_long_x = e->x; s_pl_long_y = e->y;
+    // Out-of-slop drag cancels the pending long-press.
+    int16_t dx = e->x - s_touch.start_x;
+    int16_t dy = e->y - s_touch.start_y;
+    if (dx < -TAP_SLOP_PX || dx > TAP_SLOP_PX ||
+        dy < -TAP_SLOP_PX || dy > TAP_SLOP_PX) {
+      pl_cancel_long_press();
+    }
     MenuIndex idx = { 0, (uint16_t)row };
     menu_layer_set_selected_index(s_players_menu, idx, MenuRowAlignCenter, false);
   } else if (e->type == TouchEvent_Liftoff) {
+    pl_cancel_long_press();
+    if (s_touch.phase != TG_TRACKING) {
+      // The long-press timer already fired and cleared phase; ignore this lift.
+      s_touch.phase = TG_IDLE;
+      return;
+    }
     int16_t dx = e->x - s_touch.start_x;
     int16_t dy = e->y - s_touch.start_y;
     uint32_t dt = time_ms(NULL, NULL) - s_touch.start_ms;
     bool is_tap = (dx > -TAP_SLOP_PX && dx < TAP_SLOP_PX &&
                    dy > -TAP_SLOP_PX && dy < TAP_SLOP_PX &&
                    dt < TAP_MAX_MS);
+    s_touch.phase = TG_IDLE;
     if (is_tap) {
       MenuIndex idx = { 0, (uint16_t)row };
       pl_select(s_players_menu, &idx, NULL);
     }
   }
-  if (e->type == TouchEvent_Touchdown) {
-    s_touch.start_x = e->x; s_touch.start_y = e->y;
-    s_touch.start_ms = time_ms(NULL, NULL);
-  }
+}
+
+// Button bridges so the players-window long-click can sit on top of the menu's
+// own click-config without losing scroll behaviour.
+static void btn_pl_select(ClickRecognizerRef r, void *c) {
+  if (!s_players_menu || s_players_count == 0) return;
+  MenuIndex idx = menu_layer_get_selected_index(s_players_menu);
+  pl_select(s_players_menu, &idx, NULL);
+}
+static void btn_pl_select_long(ClickRecognizerRef r, void *c) {
+  if (!s_players_menu || s_players_count == 0) return;
+  MenuIndex idx = menu_layer_get_selected_index(s_players_menu);
+  LOGI("long-press button -> row %u", (unsigned)idx.row);
+  groupsheet_window_push(idx.row);
+}
+static void btn_pl_up(ClickRecognizerRef r, void *c) {
+  if (s_players_menu) menu_layer_set_selected_next(s_players_menu, true,
+                                                   MenuRowAlignCenter, true);
+}
+static void btn_pl_down(ClickRecognizerRef r, void *c) {
+  if (s_players_menu) menu_layer_set_selected_next(s_players_menu, false,
+                                                   MenuRowAlignCenter, true);
+}
+
+static void players_click_config(void *ctx) {
+  window_single_click_subscribe(BUTTON_ID_SELECT, btn_pl_select);
+  window_long_click_subscribe(BUTTON_ID_SELECT, LONG_PRESS_MS, btn_pl_select_long, NULL);
+  window_single_repeating_click_subscribe(BUTTON_ID_UP,   150, btn_pl_up);
+  window_single_repeating_click_subscribe(BUTTON_ID_DOWN, 150, btn_pl_down);
 }
 
 static void players_window_load(Window *w) {
@@ -741,7 +1014,10 @@ static void players_window_load(Window *w) {
       .draw_separator       = pl_draw_sep,
       .select_click         = pl_select,
   });
-  menu_layer_set_click_config_onto_window(s_players_menu, w);
+  // Our own click provider replaces the menu's default so we can layer a
+  // long-press onto SELECT.  UP/DOWN scroll handlers are routed back through
+  // the menu API to keep the v0.2.0 behaviour intact.
+  window_set_click_config_provider(w, players_click_config);
   menu_layer_set_normal_colors(s_players_menu, GColorBlack, GColorWhite);
   menu_layer_set_highlight_colors(s_players_menu, GColorVividCerulean, GColorWhite);
   layer_add_child(root, menu_layer_get_layer(s_players_menu));
@@ -749,6 +1025,7 @@ static void players_window_load(Window *w) {
   touch_service_subscribe(touch_players_handler, NULL);
 }
 static void players_window_unload(Window *w) {
+  pl_cancel_long_press();
   menu_layer_destroy(s_players_menu);
   s_players_menu = NULL;
   touch_service_unsubscribe();
@@ -764,6 +1041,473 @@ static void players_window_push(void) {
     });
   }
   window_stack_push(s_players_window, true);
+}
+
+// ─── Group action sheet window ────────────────────────────────────────────
+//
+// Two visual variants live in the same window:
+//   A. Target is solo  → list of "Join <master>" / "Group with <solo>" rows.
+//   B. Target is member → readout + Leave / Add-to-group (+ Ungroup-all for master).
+//
+// Layout: 28-px header (oxford blue) at top, 28-px hint strip (darker blue)
+// at bottom, MenuLayer in between (171 px tall).  Header + hint are static
+// child layers of the window root, painted in their own update procs.
+
+#define GS_HEADER_H 28
+#define GS_HINT_H   28
+#define GS_MENU_Y   (GS_HEADER_H + 1)
+#define GS_MENU_H   (SCREEN_H - GS_HEADER_H - GS_HINT_H - 1)
+
+// Row "kinds" for the action sheet — each kind has its own draw + select.
+typedef enum {
+  GS_KIND_NONE = 0,
+  GS_KIND_JOIN,       // "Join <name>" — target a master player
+  GS_KIND_PAIR,       // "Group with <name>" — target a solo player
+  GS_KIND_READOUT,    // Non-selectable "in group with <master>" line
+  GS_KIND_LEAVE,      // "Leave group"
+  GS_KIND_ADD,        // "Add to this group" — v0.3.1 stub
+  GS_KIND_UNGROUP_ALL,// "Ungroup all"
+} GsRowKind;
+
+typedef struct {
+  GsRowKind kind;
+  uint8_t   player_idx;   // index into s_players[] (for JOIN/PAIR)
+  bool      enabled;
+} GsRow;
+
+#define MAX_GS_ROWS (MAX_PLAYERS + 4)
+static GsRow  s_gs_rows[MAX_GS_ROWS];
+static int    s_gs_row_count;
+static bool   s_gs_variant_member;
+
+// Find index of a player by id, or -1.
+static int player_index_by_id(const char *id) {
+  if (!id || !id[0]) return -1;
+  for (int i = 0; i < s_players_count; i++) {
+    if (strncmp(s_players[i].id, id, MAX_PLAYER_ID) == 0) return i;
+  }
+  return -1;
+}
+
+static void gs_build_rows(int target_idx) {
+  s_gs_row_count = 0;
+  if (target_idx < 0 || target_idx >= s_players_count) return;
+  const PlayerRow *t = &s_players[target_idx];
+  s_gs_variant_member = (t->flags & ROW_FLAG_MEMBER) != 0;
+
+  if (!s_gs_variant_member) {
+    // Variant A: solo / master target.  Show every other player as joinable.
+    for (int i = 0; i < s_players_count && s_gs_row_count < MAX_GS_ROWS; i++) {
+      if (i == target_idx) continue;
+      GsRow r = { 0 };
+      const PlayerRow *p = &s_players[i];
+      r.player_idx = (uint8_t)i;
+      r.kind    = (p->flags & ROW_FLAG_MASTER) ? GS_KIND_JOIN : GS_KIND_PAIR;
+      // can_group_with is not mirrored to the watch (the probe shows it's
+      // commonly empty), so we don't filter here.  All other players enabled.
+      r.enabled = true;
+      s_gs_rows[s_gs_row_count++] = r;
+    }
+  } else {
+    // Variant B: target is a member of a group.
+    // Row 0 — readout, non-selectable.
+    s_gs_rows[s_gs_row_count++] = (GsRow){ .kind = GS_KIND_READOUT,     .enabled = false };
+    // Row 1 — Leave group.
+    s_gs_rows[s_gs_row_count++] = (GsRow){ .kind = GS_KIND_LEAVE,       .enabled = true  };
+    // Row 2 — Add to this group (v0.3.1 stub — the picker sub-sheet ships in
+    // the next release; for v0.3.0 the row logs and pops).
+    s_gs_rows[s_gs_row_count++] = (GsRow){ .kind = GS_KIND_ADD,         .enabled = true  };
+    // Row 3 — Ungroup all (tear down the whole group from any member's POV).
+    // Mock screen 3 includes this on a member sheet, so we mirror that even
+    // though it isn't strictly required by the cmd surface — ungrouping any
+    // member sends ungroup_many over the full member set.
+    s_gs_rows[s_gs_row_count++] = (GsRow){ .kind = GS_KIND_UNGROUP_ALL, .enabled = true  };
+  }
+}
+
+static uint16_t gs_get_num_rows(MenuLayer *ml, uint16_t section, void *ctx) {
+  return s_gs_row_count > 0 ? s_gs_row_count : 1;
+}
+
+static int16_t gs_get_cell_height(MenuLayer *ml, MenuIndex *idx, void *ctx) {
+  if (s_gs_row_count == 0) return 40;
+  GsRowKind k = s_gs_rows[idx->row].kind;
+  if (k == GS_KIND_READOUT) return 36;
+  if (k == GS_KIND_LEAVE || k == GS_KIND_ADD || k == GS_KIND_UNGROUP_ALL) return 44;
+  return 40; // join / pair
+}
+
+static int16_t gs_get_sep_height(MenuLayer *ml, MenuIndex *idx, void *ctx) { return 1; }
+
+static void gs_draw_sep(GContext *ctx, const Layer *cell, MenuIndex *idx, void *c) {
+  GRect b = layer_get_bounds(cell);
+  graphics_context_set_fill_color(ctx, GColorDarkGray);
+  graphics_fill_rect(ctx, b, 0, GCornerNone);
+}
+
+static void gs_draw_join(GContext *ctx, GRect b, bool hi, const GsRow *r) {
+  const PlayerRow *p = &s_players[r->player_idx];
+  GColor primary = r->enabled ? GColorWhite     : GColorDarkGray;
+  GColor dim     = r->enabled ? (hi ? GColorPastelYellow : GColorLightGray)
+                              : GColorDarkGray;
+
+  char title[64];
+  if (r->kind == GS_KIND_JOIN) {
+    snprintf(title, sizeof(title), "Join %s", p->name);
+  } else {
+    snprintf(title, sizeof(title), "Group with %s", p->name);
+  }
+  graphics_context_set_text_color(ctx, primary);
+  graphics_draw_text(ctx, title,
+                     fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
+                     GRect(b.origin.x + 8, b.origin.y + 2, b.size.w - 16, 22),
+                     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
+
+  const char *sub;
+  char subbuf[40];
+  if (!r->enabled) {
+    sub = "incompatible";
+  } else if (r->kind == GS_KIND_JOIN) {
+    snprintf(subbuf, sizeof(subbuf), "%u players in group", (unsigned)p->group_count);
+    sub = subbuf;
+  } else {
+    sub = p->state == PS_PLAYING ? "playing" :
+          p->state == PS_PAUSED  ? "paused"  :
+          p->state == PS_IDLE    ? "idle"    : "ready";
+  }
+  graphics_context_set_text_color(ctx, dim);
+  graphics_draw_text(ctx, sub,
+                     fonts_get_system_font(FONT_KEY_GOTHIC_14),
+                     GRect(b.origin.x + 8, b.origin.y + 20, b.size.w - 16, 18),
+                     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
+}
+
+static void gs_draw_readout(GContext *ctx, GRect b) {
+  // Find the master this target is synced to.
+  const PlayerRow *target = (s_groupsheet_target >= 0 && s_groupsheet_target < s_players_count)
+      ? &s_players[s_groupsheet_target] : NULL;
+  int master_idx = target ? player_index_by_id(target->synced_to) : -1;
+  const PlayerRow *master = (master_idx >= 0) ? &s_players[master_idx] : NULL;
+
+  graphics_context_set_text_color(ctx, GColorLightGray);
+  graphics_draw_text(ctx, "in group with",
+                     fonts_get_system_font(FONT_KEY_GOTHIC_14),
+                     GRect(b.origin.x + 8, b.origin.y + 2, b.size.w - 16, 16),
+                     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
+
+  char line[64];
+  if (master) {
+    // group_count is the total players in the group including the master.
+    // The "+N" suffix reads as "master plus N OTHER members beyond myself",
+    // i.e. count minus the master AND minus the viewing player.
+    int others = master->group_count > 0 ? (int)master->group_count - 2 : 0;
+    if (others < 0) others = 0;
+    if (others > 0) snprintf(line, sizeof(line), "%s +%d", master->name, others);
+    else            snprintf(line, sizeof(line), "%s",     master->name);
+  } else {
+    snprintf(line, sizeof(line), "unknown master");
+  }
+  graphics_context_set_text_color(ctx, GColorWhite);
+  graphics_draw_text(ctx, line,
+                     fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
+                     GRect(b.origin.x + 8, b.origin.y + 16, b.size.w - 16, 22),
+                     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
+}
+
+static void gs_draw_action(GContext *ctx, GRect b, bool hi, const GsRow *r) {
+  const PlayerRow *target = (s_groupsheet_target >= 0 && s_groupsheet_target < s_players_count)
+      ? &s_players[s_groupsheet_target] : NULL;
+
+  // Icon area: 28 px wide on the left.
+  GRect ic = GRect(b.origin.x + 8, b.origin.y + 8, 22, 22);
+  const char *title = "";
+  char subbuf[64];
+  const char *sub = "";
+
+  switch (r->kind) {
+    case GS_KIND_LEAVE:
+      icon_eject(ctx, ic, GColorWhite);
+      title = "Leave group";
+      snprintf(subbuf, sizeof(subbuf), "%s plays on its own",
+               target ? target->name : "Player");
+      sub = subbuf;
+      break;
+    case GS_KIND_ADD:
+      icon_plus(ctx, ic, GColorWhite);
+      title = "Add to this group";
+      sub   = "pick a player to add";
+      break;
+    case GS_KIND_UNGROUP_ALL:
+      icon_warning(ctx, ic, GColorOrange);
+      title = "Ungroup all";
+      sub   = "tear down whole group";
+      break;
+    default: break;
+  }
+
+  GColor title_col = (r->kind == GS_KIND_UNGROUP_ALL) ? GColorOrange : GColorWhite;
+  graphics_context_set_text_color(ctx, title_col);
+  graphics_draw_text(ctx, title,
+                     fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
+                     GRect(b.origin.x + 36, b.origin.y + 4, b.size.w - 44, 22),
+                     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
+  graphics_context_set_text_color(ctx, hi ? GColorPastelYellow : GColorLightGray);
+  graphics_draw_text(ctx, sub,
+                     fonts_get_system_font(FONT_KEY_GOTHIC_14),
+                     GRect(b.origin.x + 36, b.origin.y + 24, b.size.w - 44, 18),
+                     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
+}
+
+static void gs_draw_row(GContext *ctx, const Layer *cell, MenuIndex *idx, void *c) {
+  GRect b = layer_get_bounds(cell);
+  bool hi = menu_cell_layer_is_highlighted(cell);
+  if (s_gs_row_count == 0) {
+    graphics_context_set_text_color(ctx, GColorLightGray);
+    graphics_draw_text(ctx, "No actions",
+                       fonts_get_system_font(FONT_KEY_GOTHIC_14),
+                       GRect(b.origin.x + 8, b.origin.y + 8, b.size.w - 16, 22),
+                       GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
+    return;
+  }
+  const GsRow *r = &s_gs_rows[idx->row];
+  switch (r->kind) {
+    case GS_KIND_JOIN:
+    case GS_KIND_PAIR:
+      gs_draw_join(ctx, b, hi, r); break;
+    case GS_KIND_READOUT:
+      gs_draw_readout(ctx, b); break;
+    case GS_KIND_LEAVE:
+    case GS_KIND_ADD:
+    case GS_KIND_UNGROUP_ALL:
+      gs_draw_action(ctx, b, hi, r); break;
+    default: break;
+  }
+}
+
+static void gs_select(MenuLayer *ml, MenuIndex *idx, void *c) {
+  if (s_gs_row_count == 0) return;
+  if (idx->row >= s_gs_row_count) return;
+  const GsRow *r = &s_gs_rows[idx->row];
+  if (!r->enabled) { LOGI("gs row disabled, ignoring"); return; }
+
+  const PlayerRow *target = (s_groupsheet_target >= 0 && s_groupsheet_target < s_players_count)
+      ? &s_players[s_groupsheet_target] : NULL;
+  if (!target) { LOGE("gs select with no target"); window_stack_pop(true); return; }
+
+  switch (r->kind) {
+    case GS_KIND_JOIN:
+    case GS_KIND_PAIR: {
+      const PlayerRow *other = &s_players[r->player_idx];
+      LOGI("group %s -> %s", target->id, other->id);
+      // For "Join <master>": source = target, destination = master (so target syncs to master).
+      // For "Group with <solo>": same shape — target becomes a member of the other.
+      send_group(target->id, other->id);
+      window_stack_pop(true);
+      break;
+    }
+    case GS_KIND_LEAVE:
+      LOGI("ungroup %s", target->id);
+      send_ungroup(target->id);
+      window_stack_pop(true);
+      break;
+    case GS_KIND_ADD:
+      // v0.3.1 followup: drill into a sub-sheet listing ungrouped candidates,
+      // then call set_members against the master.  For v0.3.0 we log and pop.
+      LOGI("TODO add-to-group picker (v0.3.1 followup)");
+      window_stack_pop(true);
+      break;
+    case GS_KIND_UNGROUP_ALL: {
+      // Build a CSV of every player_id in this group (master + all members).
+      // If the long-pressed target is itself a member we resolve up to the
+      // master via synced_to; otherwise the target IS the master.
+      const char *master_id = (target->flags & ROW_FLAG_MEMBER)
+          ? target->synced_to : target->id;
+      char csv[MAX_PLAYER_ID * MAX_PLAYERS + MAX_PLAYERS];
+      csv[0] = '\0';
+      size_t pos = 0;
+      pos += snprintf(csv + pos, sizeof(csv) - pos, "%s", master_id);
+      for (int i = 0; i < s_players_count && pos < sizeof(csv) - 1; i++) {
+        if (strncmp(s_players[i].synced_to, master_id, MAX_PLAYER_ID) == 0) {
+          pos += snprintf(csv + pos, sizeof(csv) - pos, ",%s", s_players[i].id);
+        }
+      }
+      LOGI("ungroup_all: %s", csv);
+      send_ungroup_all(csv);
+      window_stack_pop(true);
+      break;
+    }
+    default: break;
+  }
+}
+
+// Static header + hint overlays.  Stored as a single root-layer update proc.
+static Layer *s_gs_chrome_layer;
+static void gs_chrome_update(Layer *layer, GContext *ctx) {
+  GRect bounds = layer_get_bounds(layer);
+
+  // Background.
+  graphics_context_set_fill_color(ctx, GColorBlack);
+  graphics_fill_rect(ctx, bounds, 0, GCornerNone);
+
+  const PlayerRow *target = (s_groupsheet_target >= 0 && s_groupsheet_target < s_players_count)
+      ? &s_players[s_groupsheet_target] : NULL;
+
+  // Header strip.
+  GRect header = GRect(0, 0, SCREEN_W, GS_HEADER_H);
+  graphics_context_set_fill_color(ctx, GColorOxfordBlue);
+  graphics_fill_rect(ctx, header, 0, GCornerNone);
+
+  if (target) {
+    GColor dot =
+        target->state == PS_PLAYING ? GColorIslamicGreen :
+        target->state == PS_PAUSED  ? GColorChromeYellow : GColorDarkGray;
+    graphics_context_set_fill_color(ctx, dot);
+    graphics_fill_circle(ctx, GPoint(12, GS_HEADER_H / 2), 4);
+
+    graphics_context_set_text_color(ctx, GColorWhite);
+    graphics_draw_text(ctx, target->name,
+                       fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
+                       GRect(22, 2, SCREEN_W - 26, GS_HEADER_H - 4),
+                       GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
+  }
+
+  // Hint strip — darker oxford-blue-ish accent at the bottom.
+  GRect hint = GRect(0, SCREEN_H - GS_HINT_H, SCREEN_W, GS_HINT_H);
+  graphics_context_set_fill_color(ctx, GColorOxfordBlue);
+  graphics_fill_rect(ctx, hint, 0, GCornerNone);
+  const char *hint_str = s_gs_variant_member
+      ? "SELECT to confirm  BACK to cancel"
+      : "SELECT to join  BACK to cancel";
+  graphics_context_set_text_color(ctx, GColorLightGray);
+  graphics_draw_text(ctx, hint_str,
+                     fonts_get_system_font(FONT_KEY_GOTHIC_14),
+                     GRect(0, SCREEN_H - GS_HINT_H + 6, SCREEN_W, GS_HINT_H - 6),
+                     GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
+}
+
+// Button bridges for the action sheet — keep BACK as the standard pop, SELECT
+// confirms via the menu.
+static void btn_gs_select(ClickRecognizerRef r, void *c) {
+  if (!s_groupsheet_menu) return;
+  MenuIndex idx = menu_layer_get_selected_index(s_groupsheet_menu);
+  gs_select(s_groupsheet_menu, &idx, NULL);
+}
+static void btn_gs_up(ClickRecognizerRef r, void *c) {
+  if (s_groupsheet_menu) menu_layer_set_selected_next(s_groupsheet_menu, true,
+                                                      MenuRowAlignCenter, true);
+}
+static void btn_gs_down(ClickRecognizerRef r, void *c) {
+  if (s_groupsheet_menu) menu_layer_set_selected_next(s_groupsheet_menu, false,
+                                                      MenuRowAlignCenter, true);
+}
+static void gs_click_config(void *ctx) {
+  window_single_click_subscribe(BUTTON_ID_SELECT, btn_gs_select);
+  window_single_repeating_click_subscribe(BUTTON_ID_UP,   150, btn_gs_up);
+  window_single_repeating_click_subscribe(BUTTON_ID_DOWN, 150, btn_gs_down);
+}
+
+static void touch_groupsheet_handler(const TouchEvent *e, void *ctx) {
+  if (!s_groupsheet_menu || s_gs_row_count == 0) return;
+  // The MenuLayer sits between GS_MENU_Y and SCREEN_H - GS_HINT_H.  Map the
+  // raw finger Y back into menu-local coordinates and walk the rows.
+  int16_t y = e->y;
+  if (y < GS_MENU_Y) y = GS_MENU_Y;
+  if (y > SCREEN_H - GS_HINT_H) y = SCREEN_H - GS_HINT_H;
+  int local_y = y - GS_MENU_Y;
+  int row = 0;
+  int acc = 0;
+  for (int i = 0; i < s_gs_row_count; i++) {
+    MenuIndex mi = { 0, (uint16_t)i };
+    int h = gs_get_cell_height(s_groupsheet_menu, &mi, NULL) + 1;
+    if (local_y < acc + h) { row = i; break; }
+    acc += h;
+    row = i; // clamp to last row if y is past the end
+  }
+
+  if (e->type == TouchEvent_Touchdown) {
+    s_touch.phase   = TG_TRACKING;
+    s_touch.start_x = e->x; s_touch.start_y = e->y;
+    s_touch.start_ms = time_ms(NULL, NULL);
+    MenuIndex idx = { 0, (uint16_t)row };
+    menu_layer_set_selected_index(s_groupsheet_menu, idx, MenuRowAlignCenter, false);
+  } else if (e->type == TouchEvent_PositionUpdate) {
+    MenuIndex idx = { 0, (uint16_t)row };
+    menu_layer_set_selected_index(s_groupsheet_menu, idx, MenuRowAlignCenter, false);
+  } else if (e->type == TouchEvent_Liftoff) {
+    int16_t dx = e->x - s_touch.start_x;
+    int16_t dy = e->y - s_touch.start_y;
+    uint32_t dt = time_ms(NULL, NULL) - s_touch.start_ms;
+    bool is_tap = (dx > -TAP_SLOP_PX && dx < TAP_SLOP_PX &&
+                   dy > -TAP_SLOP_PX && dy < TAP_SLOP_PX &&
+                   dt < TAP_MAX_MS);
+    s_touch.phase = TG_IDLE;
+    if (is_tap) {
+      MenuIndex idx = { 0, (uint16_t)row };
+      gs_select(s_groupsheet_menu, &idx, NULL);
+    }
+  }
+}
+
+static void groupsheet_window_load(Window *w) {
+  Layer *root = window_get_root_layer(w);
+  GRect bounds = layer_get_bounds(root);
+
+  // Chrome layer (header + hint) covers the full root, but only draws the
+  // top + bottom strips.  Menu layer sits on top in the middle band.
+  s_gs_chrome_layer = layer_create(bounds);
+  layer_set_update_proc(s_gs_chrome_layer, gs_chrome_update);
+  layer_add_child(root, s_gs_chrome_layer);
+
+  GRect menu_rect = GRect(0, GS_MENU_Y, SCREEN_W, GS_MENU_H);
+  s_groupsheet_menu = menu_layer_create(menu_rect);
+  menu_layer_set_callbacks(s_groupsheet_menu, NULL, (MenuLayerCallbacks){
+      .get_num_rows         = gs_get_num_rows,
+      .get_cell_height      = gs_get_cell_height,
+      .get_separator_height = gs_get_sep_height,
+      .draw_row             = gs_draw_row,
+      .draw_separator       = gs_draw_sep,
+      .select_click         = gs_select,
+  });
+  window_set_click_config_provider(w, gs_click_config);
+  menu_layer_set_normal_colors(s_groupsheet_menu, GColorBlack, GColorWhite);
+  menu_layer_set_highlight_colors(s_groupsheet_menu, GColorVividCerulean, GColorWhite);
+  layer_add_child(root, menu_layer_get_layer(s_groupsheet_menu));
+
+  // Default-select first enabled row.
+  for (int i = 0; i < s_gs_row_count; i++) {
+    if (s_gs_rows[i].enabled) {
+      MenuIndex idx = { 0, (uint16_t)i };
+      menu_layer_set_selected_index(s_groupsheet_menu, idx, MenuRowAlignCenter, false);
+      break;
+    }
+  }
+
+  touch_service_unsubscribe();
+  touch_service_subscribe(touch_groupsheet_handler, NULL);
+}
+
+static void groupsheet_window_unload(Window *w) {
+  if (s_groupsheet_menu) { menu_layer_destroy(s_groupsheet_menu); s_groupsheet_menu = NULL; }
+  if (s_gs_chrome_layer) { layer_destroy(s_gs_chrome_layer);      s_gs_chrome_layer = NULL; }
+  s_groupsheet_target = -1;
+  touch_service_unsubscribe();
+  touch_service_subscribe(touch_players_handler, NULL);
+}
+
+static void groupsheet_window_push(int target_idx) {
+  if (target_idx < 0 || target_idx >= s_players_count) return;
+  s_groupsheet_target = target_idx;
+  gs_build_rows(target_idx);
+
+  if (!s_groupsheet_window) {
+    s_groupsheet_window = window_create();
+    window_set_background_color(s_groupsheet_window, GColorBlack);
+    window_set_window_handlers(s_groupsheet_window, (WindowHandlers){
+        .load   = groupsheet_window_load,
+        .unload = groupsheet_window_unload,
+    });
+  }
+  window_stack_push(s_groupsheet_window, true);
 }
 
 // ─── Volume window ────────────────────────────────────────────────────────
@@ -952,7 +1696,94 @@ static int32_t tuple_int(DictionaryIterator *iter, uint32_t key, int32_t fallbac
   return t ? t->value->int32 : fallback;
 }
 
+// Emulator-only canonical mock setup.  Triggered by
+// `pebble send-app-message --emulator emery --int 10000=99` (10000 is the
+// resource ID of ARG_INT in this app's manifest — confirm via build artifacts
+// if it ever changes).  Populates s_players[] with a 4-player layout matching
+// the v0.3.0 visual contract: Living Room master, Kitchen + Back garden
+// members, Bedroom solo idle, Office solo paused.
+static void debug_seed_players(void) {
+  s_players_count = 0;
+
+  // Row 0: Living Room — master with 2 members (Kitchen + Back garden).
+  strncpy(s_players[0].id,        "lr",          MAX_PLAYER_ID);
+  strncpy(s_players[0].name,      "Living Room", MAX_PLAYER_NAME);
+  s_players[0].state       = PS_PLAYING;
+  s_players[0].synced_to[0] = '\0';
+  s_players[0].group_count = 3;
+  s_players[0].flags       = ROW_FLAG_MASTER;
+
+  // Row 1: Kitchen — member of Living Room.
+  strncpy(s_players[1].id,        "kt",      MAX_PLAYER_ID);
+  strncpy(s_players[1].name,      "Kitchen", MAX_PLAYER_NAME);
+  s_players[1].state       = PS_PLAYING;
+  strncpy(s_players[1].synced_to, "lr", MAX_PLAYER_ID);
+  s_players[1].group_count = 0;
+  s_players[1].flags       = ROW_FLAG_MEMBER;
+
+  // Row 2: Back garden — member of Living Room.
+  strncpy(s_players[2].id,        "bg",          MAX_PLAYER_ID);
+  strncpy(s_players[2].name,      "Back garden", MAX_PLAYER_NAME);
+  s_players[2].state       = PS_PLAYING;
+  strncpy(s_players[2].synced_to, "lr", MAX_PLAYER_ID);
+  s_players[2].group_count = 0;
+  s_players[2].flags       = ROW_FLAG_MEMBER;
+
+  // Row 3: Bedroom — solo, idle.
+  strncpy(s_players[3].id,        "bd",      MAX_PLAYER_ID);
+  strncpy(s_players[3].name,      "Bedroom", MAX_PLAYER_NAME);
+  s_players[3].state       = PS_IDLE;
+  s_players[3].synced_to[0] = '\0';
+  s_players[3].group_count = 0;
+  s_players[3].flags       = 0;
+
+  // Row 4: Office — solo, paused.
+  strncpy(s_players[4].id,        "of",     MAX_PLAYER_ID);
+  strncpy(s_players[4].name,      "Office", MAX_PLAYER_NAME);
+  s_players[4].state       = PS_PAUSED;
+  s_players[4].synced_to[0] = '\0';
+  s_players[4].group_count = 0;
+  s_players[4].flags       = 0;
+
+  s_players_count = 5;
+
+  // Also seed a now-playing snapshot so the header looks normal.
+  strncpy(s_now.player_name, "Living Room", MAX_PLAYER_NAME);
+  strncpy(s_now.title,       "Demo Track",  MAX_TRACK_TEXT);
+  strncpy(s_now.artist,      "Demo Artist", MAX_TRACK_TEXT);
+  strncpy(s_now.album,       "Demo Album",  MAX_TRACK_TEXT);
+  s_now.state    = PS_PLAYING;
+  s_now.volume   = 42;
+  s_now.muted    = false;
+  s_now.shuffle  = false;
+  s_now.repeat   = RM_OFF;
+  s_now.elapsed_s  = 75;
+  s_now.duration_s = 240;
+  s_now.connected = true;
+  s_now.last_error[0] = '\0';
+
+  LOGI("debug seed: 5 players (1 master + 2 members + 2 solo)");
+}
+
 static void inbox_received(DictionaryIterator *iter, void *ctx) {
+  // Emulator-only debug seed.  Sent via
+  // `pebble send-app-message --emulator emery --int 10000=99`, where 10000 is
+  // the resource ID for CMD in this app's manifest and 99 is CMD_DEBUG_SEED.
+  // Don't gate on a #define — leaving the command compiled but unreachable on
+  // real hardware (the JS bridge never forwards 99) is the simplest contract.
+  Tuple *cmd_t = dict_find(iter, MESSAGE_KEY_CMD);
+  if (cmd_t && cmd_t->value->int32 == CMD_DEBUG_SEED) {
+    debug_seed_players();
+    // Open the players window if it's not already on top so screenshots
+    // capture the canonical group layout without manual navigation.
+    if (!s_players_window || window_stack_get_top_window() != s_players_window) {
+      players_window_push();
+    }
+    if (s_players_menu) menu_layer_reload_data(s_players_menu);
+    if (s_now_root_layer) layer_mark_dirty(s_now_root_layer);
+    return;
+  }
+
   Tuple *err = dict_find(iter, MESSAGE_KEY_ST_ERROR);
   if (err) {
     strncpy(s_now.last_error, err->value->cstring, sizeof(s_now.last_error) - 1);
@@ -979,6 +1810,16 @@ static void inbox_received(DictionaryIterator *iter, void *ctx) {
       copy_tuple_str(iter, MESSAGE_KEY_PLAYER_ROW_NAME, s_players[idx].name, MAX_PLAYER_NAME);
       int32_t st = tuple_int(iter, MESSAGE_KEY_PLAYER_ROW_STATE, PS_UNKNOWN);
       s_players[idx].state = (PlaybackState)st;
+      // Reset group fields first so a stale row doesn't carry over if the
+      // phone now reports this player solo (the synced_to key won't fire
+      // copy_tuple_str if the phone sends "" omitted in some future opt).
+      s_players[idx].synced_to[0] = '\0';
+      s_players[idx].group_count  = 0;
+      s_players[idx].flags        = 0;
+      copy_tuple_str(iter, MESSAGE_KEY_PLAYER_ROW_SYNCED_TO,
+                     s_players[idx].synced_to, MAX_PLAYER_ID);
+      s_players[idx].group_count = (uint8_t)tuple_int(iter, MESSAGE_KEY_PLAYER_ROW_GROUP_COUNT, 0);
+      s_players[idx].flags       = (uint8_t)tuple_int(iter, MESSAGE_KEY_PLAYER_ROW_FLAGS, 0);
       if (idx + 1 > s_players_count) s_players_count = idx + 1;
     }
   }
@@ -1042,18 +1883,29 @@ static void outbox_failed(DictionaryIterator *iter, AppMessageResult reason, voi
 
 // ─── Now-playing window lifecycle ─────────────────────────────────────────
 
+static void now_window_appear(Window *w) {
+  // Re-arm tick when we come back to the front (sub-window popped, etc).
+  s_now_visible = true;
+  touch_service_subscribe(touch_now_handler, NULL);
+  schedule_tick();
+}
+
+static void now_window_disappear(Window *w) {
+  // Sub-window pushed on top OR app backgrounded: stop the redraw loop.
+  s_now_visible = false;
+  cancel_tick();
+  touch_service_unsubscribe();
+}
+
 static void now_window_load(Window *w) {
   Layer *root = window_get_root_layer(w);
   s_now_root_layer = root;
   layer_set_update_proc(root, now_root_update);
   window_set_click_config_provider(w, now_click_config);
-  touch_service_subscribe(touch_now_handler, NULL);
-  schedule_tick();
 }
 
 static void now_window_unload(Window *w) {
-  if (s_tick_timer) { app_timer_cancel(s_tick_timer); s_tick_timer = NULL; }
-  touch_service_unsubscribe();
+  cancel_tick();
 }
 
 // ─── App lifecycle ────────────────────────────────────────────────────────
@@ -1070,24 +1922,34 @@ static void init(void) {
   s_now_window = window_create();
   window_set_background_color(s_now_window, GColorBlack);
   window_set_window_handlers(s_now_window, (WindowHandlers){
-      .load = now_window_load,
-      .unload = now_window_unload,
+      .load     = now_window_load,
+      .unload   = now_window_unload,
+      .appear   = now_window_appear,
+      .disappear= now_window_disappear,
   });
   window_stack_push(s_now_window, true);
+
+  // Pause our redraw / poll loop while the screen is off or another app is on
+  // top — otherwise the 1 Hz tick keeps the watch awake and trips the
+  // system watchdog after the display blanks.
+  app_focus_service_subscribe_handlers((AppFocusHandlers){
+      .did_focus = app_focus_handler,
+  });
 
   send_simple_cmd(CMD_REQUEST_STATE);
 }
 
 static void deinit(void) {
   window_destroy(s_now_window);
-  if (s_players_window) window_destroy(s_players_window);
-  if (s_volume_window)  window_destroy(s_volume_window);
-  if (s_quick_window)   window_destroy(s_quick_window);
+  if (s_players_window)    window_destroy(s_players_window);
+  if (s_volume_window)     window_destroy(s_volume_window);
+  if (s_quick_window)      window_destroy(s_quick_window);
+  if (s_groupsheet_window) window_destroy(s_groupsheet_window);
 }
 
 int main(void) {
   init();
-  LOGI("Music Assistant remote v0.2.0 started.");
+  LOGI("Music Assistant remote v0.3.0 started.");
   app_event_loop();
   deinit();
   return 0;
