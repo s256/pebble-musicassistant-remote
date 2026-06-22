@@ -196,7 +196,7 @@
         </div>
       </div>
       <div class="hint" id="authModeHint">
-        Provider availability is detected after Test connection.
+        Home Assistant requires Music Assistant to run as the HA add-on.
       </div>
     </div>
 
@@ -443,57 +443,16 @@
   }
 
   // ─── Auth-mode UI ──────────────────────────────────────────────────────
-  // Switch between builtin / HA sub-panes; called from radio onChange AND
-  // when applyProviders narrows the available list.
+  // Both radios are ALWAYS visible — the user picks.  We used to probe
+  // /auth/providers on host blur and hide the HA radio when MA didn't expose
+  // it, but the probe is fragile across origins (browser-vs-phone CORS
+  // quirks, slow first paint, etc.) and surfaces fewer options than the
+  // server actually supports.  Simpler and more honest to show both and let
+  // the user pick.  If the HA path fails server-side they'll see the error
+  // from auth/authorization_url verbatim.
   function applyAuthModeUI() {
-    var mode = authMode;
-    var haAllowed = !!availableProviders.homeassistant;
-    if (mode === 'homeassistant' && !haAllowed) {
-      mode = 'builtin';
-      authMode = 'builtin';
-      authBuiltinRadio.checked = true;
-    }
-    builtinFields.hidden = (mode !== 'builtin');
-    haFields.hidden     = (mode !== 'homeassistant');
-    authModeHaWrap.hidden = !haAllowed;
-    if (!haAllowed) {
-      authModeHint.textContent =
-        'Home Assistant login requires Music Assistant to be running as a Home Assistant add-on.';
-    } else {
-      authModeHint.textContent = 'Pick how you want to authenticate.';
-    }
-  }
-
-  // Apply the providers list returned by GET /auth/providers (no auth req).
-  function applyProviders(list) {
-    availableProviders = { builtin: false, homeassistant: false };
-    (list || []).forEach(function (p) {
-      var id = p && (p.id || p.provider_id || p.type);
-      if (id === 'builtin')        availableProviders.builtin = true;
-      if (id === 'homeassistant')  availableProviders.homeassistant = true;
-      // Some MA versions expose HA under "hass" — accept the alias.
-      if (id === 'hass')           availableProviders.homeassistant = true;
-    });
-    // Fallback: if neither is reported, assume builtin so the form still works.
-    if (!availableProviders.builtin && !availableProviders.homeassistant) {
-      availableProviders.builtin = true;
-    }
-    applyAuthModeUI();
-  }
-
-  function fetchProvidersFromHost() {
-    var host = normaliseHost(hostEl.value);
-    if (!/^https?:\/\//i.test(host)) return Promise.resolve();
-    return fetch(host + '/auth/providers')
-      .then(function (r) { return r.ok ? r.json() : []; })
-      .then(function (body) {
-        // /auth/providers returns an array of provider records directly.
-        var list = Array.isArray(body) ? body
-                 : (body && Array.isArray(body.result)) ? body.result
-                 : [];
-        applyProviders(list);
-      })
-      .catch(function () { /* leave defaults */ });
+    builtinFields.hidden = (authMode !== 'builtin');
+    haFields.hidden     = (authMode !== 'homeassistant');
   }
 
   // ─── Auth-mode radio wiring ────────────────────────────────────────────
@@ -622,7 +581,6 @@
       userBlob = user || null;
       setMsg(haMsg, 'Signed in.', 'ok');
       renderSignedInBadge();
-      fetchProvidersFromHost();
       discoverCard.hidden = false;
     }).catch(function (err) {
       // The token is technically already valid — auth/me failure here is
@@ -636,19 +594,12 @@
   if (qs('ha_auth') === 'callback') {
     // Defer to next tick so the rest of init completes first.
     setTimeout(handleHaCallback, 0);
-  } else if (hostEl.value) {
-    // Probe providers once on load if a host is already known.  Cheap
-    // request and keeps the radio in sync with reality.
-    fetchProvidersFromHost();
   }
 
   // ─── Test connection / unlock Discover ─────────────────────────────────
   testBtn.addEventListener('click', function () {
     setMsg(authMsg, 'Authenticating...', null);
     testBtn.disabled = true;
-    // Provider list probe in parallel so the radio updates even if HA wasn't
-    // visible before — keeps the UI consistent on a host change.
-    fetchProvidersFromHost();
     maLogin().then(function () {
       // Pull the User record so the signed-in badge has a display_name.
       return maCall('auth/me', {}).catch(function () { return null; });
