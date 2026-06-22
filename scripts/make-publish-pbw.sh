@@ -28,13 +28,31 @@ if [[ ! -f "$SRC" ]]; then
   exit 1
 fi
 
+# --- Version-stamp sanity check ----------------------------------------
+# waf aggressively caches appinfo.json from a previous build, so bumping
+# package.json without `pebble clean` leaves the OLD version inside the
+# .pbw.  This bit me with v1.0.1, which shipped a binary still stamped
+# 1.0.0.  Refuse to produce a publish artifact unless the embedded
+# versionLabel matches package.json.
+
+PKG_VERSION=$(python3 -c "import json; print(json.load(open('package.json'))['version'])")
+PBW_VERSION=$(unzip -p "$SRC" appinfo.json | python3 -c "import json, sys; print(json.load(sys.stdin).get('versionLabel', ''))")
+
+if [[ "$PKG_VERSION" != "$PBW_VERSION" ]]; then
+  echo "error: package.json version ($PKG_VERSION) does not match .pbw appinfo.json versionLabel ($PBW_VERSION)" >&2
+  echo "       waf likely cached an older appinfo.  Run:" >&2
+  echo "         pebble clean && pebble build" >&2
+  echo "       then re-run this script." >&2
+  exit 1
+fi
+
 cp -f "$SRC" "$DST"
 
 if unzip -l "$DST" | grep -q 'pebble-js-app.js.map'; then
   zip -dq "$DST" pebble-js-app.js.map
 fi
 
-echo "Wrote $DST"
+echo "Wrote $DST  (version $PBW_VERSION)"
 unzip -l "$DST"
 
 # Verify no '/home/' personal-path leaks remain.  Loud failure so a future
