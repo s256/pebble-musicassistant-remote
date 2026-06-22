@@ -104,6 +104,58 @@
   .row-search { display: flex; gap: 8px; align-items: center; }
   .row-search input { flex: 1; }
   .loading { color: var(--muted); font-size: 12px; }
+
+  /* Auth mode picker — radio cards.  Hide the native input, style the label
+     as a tappable card with a left dot affordance.  Only the selected card
+     gets the cerulean border + dot fill. */
+  .auth-modes { display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px; }
+  .auth-mode { position: relative; }
+  .auth-mode input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+  .auth-mode label {
+    display: flex; align-items: center; gap: 12px;
+    padding: 12px 14px; border: 1px solid var(--border); border-radius: 8px;
+    background: var(--input); color: var(--fg); cursor: pointer; margin: 0;
+    font-size: 15px;
+  }
+  .auth-mode label::before {
+    content: ''; width: 16px; height: 16px; border-radius: 50%;
+    border: 2px solid var(--border); background: transparent; flex: 0 0 auto;
+  }
+  .auth-mode input[type="radio"]:checked + label {
+    border-color: var(--accent);
+  }
+  .auth-mode input[type="radio"]:checked + label::before {
+    border-color: var(--accent); background: var(--accent);
+    box-shadow: inset 0 0 0 3px var(--card);
+  }
+  .auth-mode[hidden] { display: none; }
+  .auth-mode .sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
+
+  /* Signed-in badge — green left accent strip + display_name (role) line. */
+  .signed-in {
+    display: flex; align-items: center; gap: 12px;
+    padding: 12px 14px; border: 1px solid var(--ok); border-radius: 8px;
+    background: rgba(63, 185, 80, 0.08); margin-bottom: 12px;
+  }
+  .signed-in .who { flex: 1; min-width: 0; }
+  .signed-in .name { font-size: 15px; font-weight: 600; color: var(--fg); }
+  .signed-in .role { font-size: 12px; color: var(--muted); }
+  .signed-in button {
+    flex: 0 0 auto; padding: 8px 14px; font-size: 13px;
+    background: transparent; color: var(--fg); border: 1px solid var(--border);
+    border-radius: 6px; cursor: pointer; font-weight: 500;
+  }
+  .signed-in[hidden] { display: none; }
+
+  /* Field-group wrappers that hide together when an auth mode is inactive. */
+  .builtin-fields[hidden], .ha-fields[hidden] { display: none; }
+  .ha-fields { margin-top: 4px; }
+  .ha-fields p { color: var(--muted); margin: 0 0 12px; font-size: 13px; }
+  .ha-fields button.primary {
+    background: var(--accent); color: var(--accent-fg); border: none;
+    padding: 14px; border-radius: 8px; font-size: 16px; font-weight: 600;
+    width: 100%; cursor: pointer;
+  }
 </style>
 </head>
 <body>
@@ -122,21 +174,59 @@
         Music Assistant base URL. For Home Assistant add-on use the same port (default 8095).
       </div>
     </div>
-    <div class="row">
-      <label for="username">Username</label>
-      <input type="text" id="username" name="username"
-             autocapitalize="off" autocorrect="off" spellcheck="false" />
-      <div class="hint">Your built-in Music Assistant username.</div>
+
+    <div class="signed-in" id="signedInBadge" hidden>
+      <div class="who">
+        <div class="name" id="signedInName">—</div>
+        <div class="role" id="signedInRole">—</div>
+      </div>
+      <button type="button" id="signOutBtn">Sign out</button>
     </div>
-    <div class="row">
-      <label for="password">Password</label>
-      <input type="password" id="password" name="password"
-             autocapitalize="off" autocorrect="off" spellcheck="false" />
-      <div class="hint" id="passHint">Stored locally on your phone.</div>
+
+    <div class="row" id="authModeRow">
+      <label>Authentication</label>
+      <div class="auth-modes" id="authModes">
+        <div class="auth-mode" id="authModeBuiltinWrap">
+          <input type="radio" id="authBuiltin" name="authMode" value="builtin" checked />
+          <label for="authBuiltin">Music Assistant</label>
+        </div>
+        <div class="auth-mode" id="authModeHaWrap">
+          <input type="radio" id="authHa" name="authMode" value="homeassistant" />
+          <label for="authHa">Home Assistant</label>
+        </div>
+      </div>
+      <div class="hint" id="authModeHint">
+        Provider availability is detected after Test connection.
+      </div>
     </div>
-    <div class="msg" id="authMsg"></div>
-    <div class="actions">
-      <button type="button" class="secondary" id="testBtn">Test connection</button>
+
+    <div class="builtin-fields" id="builtinFields">
+      <div class="row">
+        <label for="username">Username</label>
+        <input type="text" id="username" name="username"
+               autocapitalize="off" autocorrect="off" spellcheck="false" />
+        <div class="hint">Your built-in Music Assistant username.</div>
+      </div>
+      <div class="row">
+        <label for="password">Password</label>
+        <input type="password" id="password" name="password"
+               autocapitalize="off" autocorrect="off" spellcheck="false" />
+        <div class="hint" id="passHint">Stored locally on your phone.</div>
+      </div>
+      <div class="msg" id="authMsg"></div>
+      <div class="actions">
+        <button type="button" class="secondary" id="testBtn">Test connection</button>
+      </div>
+    </div>
+
+    <div class="ha-fields" id="haFields" hidden>
+      <p>
+        Authenticate against your Home Assistant account. The browser is
+        redirected to your Home Assistant login page; on return your Music
+        Assistant token is saved automatically.
+      </p>
+      <div class="msg" id="haMsg"></div>
+      <button type="button" class="primary" id="haSignInBtn">Sign in with Home Assistant</button>
     </div>
   </section>
 
@@ -194,6 +284,20 @@
   var authMsg  = document.getElementById('authMsg');
   var testBtn  = document.getElementById('testBtn');
 
+  var authModeRow      = document.getElementById('authModeRow');
+  var authModeHint     = document.getElementById('authModeHint');
+  var authModeHaWrap   = document.getElementById('authModeHaWrap');
+  var authBuiltinRadio = document.getElementById('authBuiltin');
+  var authHaRadio      = document.getElementById('authHa');
+  var builtinFields    = document.getElementById('builtinFields');
+  var haFields         = document.getElementById('haFields');
+  var haSignInBtn      = document.getElementById('haSignInBtn');
+  var haMsg            = document.getElementById('haMsg');
+  var signedInBadge    = document.getElementById('signedInBadge');
+  var signedInName     = document.getElementById('signedInName');
+  var signedInRole     = document.getElementById('signedInRole');
+  var signOutBtn       = document.getElementById('signOutBtn');
+
   var discoverCard = document.getElementById('discover-card');
   var searchInput  = document.getElementById('searchInput');
   var chipsEl      = document.getElementById('chips');
@@ -204,6 +308,12 @@
   var slotCount  = document.getElementById('slotCount');
 
   // ─── Query-string boot ─────────────────────────────────────────────────
+  // Two distinct entry paths:
+  //   1. Normal — PebbleKit JS opens us with host/user/hasPass/slots/authMode
+  //      query params (showConfiguration handler). We rehydrate the form.
+  //   2. OAuth callback — Home Assistant redirects back to us with
+  //      ?ha_auth=callback&code=...&state=...&host=...  We exchange the code
+  //      for an MA bearer, persist it, and show the signed-in badge.
   function qs(name) {
     var m = location.search.match(new RegExp('[?&]' + name + '=([^&]*)'));
     return m ? decodeURIComponent(m[1].replace(/\+/g, ' ')) : '';
@@ -211,7 +321,7 @@
   hostEl.value = qs('host');
   userEl.value = qs('user');
   if (qs('hasPass') === '1') {
-    passEl.placeholder = '•••• (already set — leave blank to keep)';
+    passEl.placeholder = '•••• (already set - leave blank to keep)';
     passHint.textContent = 'Leave blank to keep the password you saved before.';
   }
 
@@ -220,6 +330,24 @@
   var msgId = 1;
   var activeTypes = { album: true, artist: true, playlist: true };
   var slots = [];
+  // Auth-mode state (v1.1).  authMode mirrors the radio; userBlob is the
+  // cached User record from auth/me — populated either by HA callback or by
+  // builtin Test connection followed by auth/me.
+  var authMode = qs('authMode') || 'builtin';
+  var userBlob = null;
+  try {
+    var rawUser = qs('userBlob');
+    if (rawUser) userBlob = JSON.parse(rawUser);
+  } catch (e) { /* ignore malformed */ }
+  // hasToken flags an already-saved bearer.  The token itself isn't
+  // round-tripped through the URL (privacy/length); on OAuth callback we
+  // rebuild it; otherwise we treat the existing watch-side token as opaque
+  // and only let the user re-authenticate.
+  var hasExistingToken = qs('hasToken') === '1';
+
+  // Provider list discovered via /auth/providers.  Until we've probed,
+  // assume builtin only and hide the HA radio.
+  var availableProviders = { builtin: true, homeassistant: false };
 
   try {
     var rawSlots = qs('slots');
@@ -298,13 +426,240 @@
     });
   }
 
+  // /api endpoint without an Authorization header — used for unauth commands
+  // (auth/providers, auth/authorization_url, auth/login on the HA callback).
+  function maCallPublic(command, args) {
+    var host = normaliseHost(hostEl.value);
+    return fetch(host + '/api', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message_id: String(msgId++), command: command, args: args || {},
+      }),
+    }).then(function (r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    });
+  }
+
+  // ─── Auth-mode UI ──────────────────────────────────────────────────────
+  // Switch between builtin / HA sub-panes; called from radio onChange AND
+  // when applyProviders narrows the available list.
+  function applyAuthModeUI() {
+    var mode = authMode;
+    var haAllowed = !!availableProviders.homeassistant;
+    if (mode === 'homeassistant' && !haAllowed) {
+      mode = 'builtin';
+      authMode = 'builtin';
+      authBuiltinRadio.checked = true;
+    }
+    builtinFields.hidden = (mode !== 'builtin');
+    haFields.hidden     = (mode !== 'homeassistant');
+    authModeHaWrap.hidden = !haAllowed;
+    if (!haAllowed) {
+      authModeHint.textContent =
+        'Home Assistant login requires Music Assistant to be running as a Home Assistant add-on.';
+    } else {
+      authModeHint.textContent = 'Pick how you want to authenticate.';
+    }
+  }
+
+  // Apply the providers list returned by GET /auth/providers (no auth req).
+  function applyProviders(list) {
+    availableProviders = { builtin: false, homeassistant: false };
+    (list || []).forEach(function (p) {
+      var id = p && (p.id || p.provider_id || p.type);
+      if (id === 'builtin')        availableProviders.builtin = true;
+      if (id === 'homeassistant')  availableProviders.homeassistant = true;
+      // Some MA versions expose HA under "hass" — accept the alias.
+      if (id === 'hass')           availableProviders.homeassistant = true;
+    });
+    // Fallback: if neither is reported, assume builtin so the form still works.
+    if (!availableProviders.builtin && !availableProviders.homeassistant) {
+      availableProviders.builtin = true;
+    }
+    applyAuthModeUI();
+  }
+
+  function fetchProvidersFromHost() {
+    var host = normaliseHost(hostEl.value);
+    if (!/^https?:\/\//i.test(host)) return Promise.resolve();
+    return fetch(host + '/auth/providers')
+      .then(function (r) { return r.ok ? r.json() : []; })
+      .then(function (body) {
+        // /auth/providers returns an array of provider records directly.
+        var list = Array.isArray(body) ? body
+                 : (body && Array.isArray(body.result)) ? body.result
+                 : [];
+        applyProviders(list);
+      })
+      .catch(function () { /* leave defaults */ });
+  }
+
+  // ─── Auth-mode radio wiring ────────────────────────────────────────────
+  function onAuthModeChange() {
+    authMode = authBuiltinRadio.checked ? 'builtin' : 'homeassistant';
+    applyAuthModeUI();
+  }
+  authBuiltinRadio.addEventListener('change', onAuthModeChange);
+  authHaRadio.addEventListener('change', onAuthModeChange);
+
+  // Pre-select from saved authMode.
+  if (authMode === 'homeassistant') {
+    authHaRadio.checked = true;
+  } else {
+    authBuiltinRadio.checked = true;
+  }
+  applyAuthModeUI();
+
+  // Signed-in badge — shown iff we have a non-expired token AND a user record.
+  function renderSignedInBadge() {
+    if (token && userBlob) {
+      signedInBadge.hidden = false;
+      signedInName.textContent =
+        userBlob.display_name || userBlob.username || 'Authenticated user';
+      var role = userBlob.role || (userBlob.is_admin ? 'admin' : 'user');
+      var mode = authMode === 'homeassistant' ? 'Home Assistant' : 'Music Assistant';
+      signedInRole.textContent = role + ' - via ' + mode;
+    } else if (hasExistingToken && userBlob) {
+      // Token isn't in this tab's memory yet (page reload), but a token was
+      // saved before — render the badge in a stale state so the user can
+      // sign out without re-authenticating.
+      signedInBadge.hidden = false;
+      signedInName.textContent =
+        userBlob.display_name || userBlob.username || 'Signed in';
+      var role2 = userBlob.role || 'user';
+      var mode2 = authMode === 'homeassistant' ? 'Home Assistant' : 'Music Assistant';
+      signedInRole.textContent = role2 + ' - via ' + mode2;
+    } else {
+      signedInBadge.hidden = true;
+    }
+  }
+  renderSignedInBadge();
+
+  // Sign out — best-effort revoke, then clear local state.  Host / username
+  // / password / slots are intentionally preserved so the user can re-enter
+  // credentials without re-typing host.
+  signOutBtn.addEventListener('click', function () {
+    var didCall = Promise.resolve();
+    if (token) {
+      didCall = maCall('auth/logout', {}).catch(function () { /* ignore */ });
+    }
+    didCall.then(function () {
+      token = null;
+      userBlob = null;
+      hasExistingToken = false;
+      passEl.value = '';
+      setMsg(authMsg, 'Signed out.', null);
+      setMsg(haMsg, '', null);
+      discoverCard.hidden = true;
+      renderSignedInBadge();
+    });
+  });
+
+  // ─── HA OAuth — outbound and callback ──────────────────────────────────
+  function buildReturnUrl() {
+    var host = normaliseHost(hostEl.value);
+    return location.origin + location.pathname +
+           '?ha_auth=callback&host=' + encodeURIComponent(host);
+  }
+
+  haSignInBtn.addEventListener('click', function () {
+    var host = normaliseHost(hostEl.value);
+    if (!/^https?:\/\//i.test(host)) {
+      setMsg(haMsg, 'Host must start with http:// or https://', 'err');
+      return;
+    }
+    setMsg(haMsg, 'Requesting authorization URL...', null);
+    haSignInBtn.disabled = true;
+    // auth/authorization_url is unauthenticated — no Authorization header.
+    // Provider id is the HA login provider ID; MA uses "homeassistant"
+    // (verified live against the user's MA instance).
+    maCallPublic('auth/authorization_url', {
+      provider_id: 'homeassistant',
+      return_url: buildReturnUrl(),
+    }).then(function (body) {
+      var res = body && (body.result || body);
+      var url = res && (res.authorization_url || res.url);
+      if (!url) throw new Error('No authorization_url in response');
+      window.location.href = url;
+    }).catch(function (err) {
+      setMsg(haMsg, 'Failed: ' + (err.message || err), 'err');
+      haSignInBtn.disabled = false;
+    });
+  });
+
+  // OAuth callback path — MA's /auth/callback handler exchanges the HA OAuth
+  // code server-side, mints a fresh MA bearer token, and redirects the
+  // browser back to our return_url with `?code=<MA_TOKEN>` appended.  So the
+  // `code` we receive here is ALREADY the bearer — no further /api call is
+  // needed.  (See music-assistant/server's webserver/controller.py
+  // _handle_auth_callback for the canonical implementation.)
+  function handleHaCallback() {
+    var code = qs('code');
+    var host = qs('host');
+    if (host) hostEl.value = host;
+    if (!code) {
+      setMsg(haMsg, 'OAuth callback missing code parameter.', 'err');
+      return;
+    }
+    authMode = 'homeassistant';
+    authHaRadio.checked = true;
+    applyAuthModeUI();
+    setMsg(haMsg, 'Completing sign-in...', null);
+
+    token = code;
+    hasExistingToken = true;
+
+    // Strip ?ha_auth=...&code=... so a refresh doesn't try to redo this.
+    history.replaceState({}, '', location.pathname);
+
+    // Fetch the User record so we can render the signed-in badge.  This also
+    // doubles as our token-validity check: a 401 here means the redirect
+    // arrived but MA already invalidated the token — surface the error.
+    maCall('auth/me', {}).then(function (body) {
+      var user = body && (body.result || body);
+      userBlob = user || null;
+      setMsg(haMsg, 'Signed in.', 'ok');
+      renderSignedInBadge();
+      fetchProvidersFromHost();
+      discoverCard.hidden = false;
+    }).catch(function (err) {
+      // The token is technically already valid — auth/me failure here is
+      // unusual.  Surface the error but keep the token; the user can still
+      // save settings and the watch will re-validate on its own.
+      setMsg(haMsg, 'Signed in (could not fetch profile: ' + (err.message || err) + ')', null);
+      renderSignedInBadge();
+    });
+  }
+
+  if (qs('ha_auth') === 'callback') {
+    // Defer to next tick so the rest of init completes first.
+    setTimeout(handleHaCallback, 0);
+  } else if (hostEl.value) {
+    // Probe providers once on load if a host is already known.  Cheap
+    // request and keeps the radio in sync with reality.
+    fetchProvidersFromHost();
+  }
+
   // ─── Test connection / unlock Discover ─────────────────────────────────
   testBtn.addEventListener('click', function () {
     setMsg(authMsg, 'Authenticating...', null);
     testBtn.disabled = true;
+    // Provider list probe in parallel so the radio updates even if HA wasn't
+    // visible before — keeps the UI consistent on a host change.
+    fetchProvidersFromHost();
     maLogin().then(function () {
+      // Pull the User record so the signed-in badge has a display_name.
+      return maCall('auth/me', {}).catch(function () { return null; });
+    }).then(function (body) {
+      authMode = 'builtin';
+      var user = body && (body.result || body) || null;
+      userBlob = user;
+      hasExistingToken = true;
       setMsg(authMsg, 'Connected.', 'ok');
       discoverCard.hidden = false;
+      renderSignedInBadge();
       searchInput.focus();
     }).catch(function (err) {
       setMsg(authMsg, err.message || String(err), 'err');
@@ -512,7 +867,11 @@
       setMsg(authMsg, 'Host must start with http:// or https://', 'err');
       return;
     }
-    if (!user) {
+    // In HA mode, username/password aren't required — auth flowed through
+    // OAuth and gave us a bearer token directly.  In builtin mode the
+    // phone-side bridge needs username for silent re-auth, but password
+    // can be blank to mean "keep what's saved".
+    if (authMode === 'builtin' && !user) {
       setMsg(authMsg, 'Username is required.', 'err');
       return;
     }
@@ -528,10 +887,13 @@
       });
 
     returnToPebble({
-      host: host,
-      username: user,
-      password: pass,
-      slots: cleanSlots,
+      host:        host,
+      username:    user,
+      password:    pass,
+      slots:       cleanSlots,
+      authMode:    authMode,
+      accessToken: token || null,
+      user:        userBlob || null,
     });
   });
 
