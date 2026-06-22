@@ -359,7 +359,12 @@
       media_types: types,
       limit: 25,
     }).then(function (body) {
-      var r = (body && body.result) || {};
+      // Music Assistant returns the raw command result (no `{result: ...}`
+      // wrapper).  Fall back to `body.result` for any future command shape
+      // change.
+      var r = body && (body.artists || body.albums || body.playlists)
+            ? body
+            : (body && body.result) || {};
       var rows = [];
       if (activeTypes.album    && r.albums)    rows = rows.concat(r.albums.map(function (x)    { return { kind: 'album',    item: x }; }));
       if (activeTypes.artist   && r.artists)   rows = rows.concat(r.artists.map(function (x)   { return { kind: 'artist',   item: x }; }));
