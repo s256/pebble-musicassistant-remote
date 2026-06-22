@@ -24,7 +24,12 @@ var CMD = {
   MUTE_TOGGLE:     9,
   SHUFFLE_TOGGLE:  10,
   REPEAT_CYCLE:    11,
+  QUICK_PLAY:      12,
 };
+
+var MAX_QUICK_SLOTS = 10;
+var MAX_QUICK_LABEL = 40;
+var MAX_QUICK_URI   = 120;
 
 var STATE = { UNKNOWN: 0, IDLE: 1, PAUSED: 2, PLAYING: 3 };
 var REPEAT = { off: 0, one: 1, all: 2 };
@@ -270,6 +275,31 @@ function pushError(msg) {
   enqueue({ ST_ERROR: clamp32(msg) });
 }
 
+function clampStr(s, n) {
+  if (!s) return '';
+  if (s.length <= n) return s;
+  return s.substring(0, n);
+}
+
+function getSlots() {
+  if (settings && Array.isArray(settings.slots)) return settings.slots;
+  return [];
+}
+
+function pushQuickSlots() {
+  var slots = getSlots().slice(0, MAX_QUICK_SLOTS);
+  enqueue({ QUICK_BEGIN: 1 });
+  slots.forEach(function (s, i) {
+    if (!s || !s.uri) return;
+    enqueue({
+      QUICK_ROW_INDEX: i,
+      QUICK_ROW_LABEL: clampStr(s.label || s.uri, MAX_QUICK_LABEL),
+      QUICK_ROW_URI:   clampStr(s.uri, MAX_QUICK_URI),
+    });
+  });
+  enqueue({ QUICK_END: 1 });
+}
+
 // ─── Poll ─────────────────────────────────────────────────────────────────
 
 function pollOnce(cb) {
@@ -412,6 +442,16 @@ function handleWatchCmd(cmd, payload) {
       });
       break;
 
+    case CMD.QUICK_PLAY:
+      withActive(function (active) {
+        var uri = payload.ARG_STR;
+        if (!uri) { pushError('Empty quick-play URI'); return; }
+        maCall('player_queues/play_media',
+          { queue_id: active.queue_id, media: uri, option: 'replace' },
+          function (err) { if (err) pushError(err.message); quickRepoll(); });
+      });
+      break;
+
     default:
       console.log('[ma] unknown cmd', cmd);
   }
@@ -422,6 +462,9 @@ function handleWatchCmd(cmd, payload) {
 Pebble.addEventListener('ready', function () {
   console.log('[ma] PebbleKit JS ready');
   settings = loadSettings();
+  // Always push the cached slot list so Quick Play works even before the
+  // first poll (and even when the watch's persist is empty).
+  pushQuickSlots();
   if (!settings || !settings.host) {
     pushError('Configure host in settings');
     return;
@@ -436,9 +479,11 @@ Pebble.addEventListener('appmessage', function (e) {
 
 Pebble.addEventListener('showConfiguration', function () {
   var cur = loadSettings() || {};
+  var slotsJson = JSON.stringify(Array.isArray(cur.slots) ? cur.slots : []);
   var qs = 'host='     + encodeURIComponent(cur.host || '')
          + '&user='    + encodeURIComponent(cur.username || '')
-         + '&hasPass=' + (cur.password ? '1' : '0');
+         + '&hasPass=' + (cur.password ? '1' : '0')
+         + '&slots='   + encodeURIComponent(slotsJson);
   Pebble.openURL(CONFIG_URL + '?' + qs);
 });
 
@@ -448,16 +493,28 @@ Pebble.addEventListener('webviewclosed', function (e) {
   try { next = JSON.parse(decodeURIComponent(e.response)); }
   catch (err) { console.log('[ma] settings parse error', err); return; }
 
-  // Merge — if user left password blank, keep the existing one.
+  // Merge — if user left password blank, keep the existing one. Slots are
+  // overwritten when the page sends them (the page sends the complete list).
   var prev = loadSettings() || {};
+  var slots = Array.isArray(next.slots) ? next.slots.slice(0, MAX_QUICK_SLOTS) : (prev.slots || []);
+  slots = slots
+    .filter(function (s) { return s && s.uri; })
+    .map(function (s) {
+      return {
+        label: clampStr(String(s.label || s.uri), MAX_QUICK_LABEL),
+        uri:   clampStr(String(s.uri), MAX_QUICK_URI),
+      };
+    });
   var merged = {
     host:     (next.host || '').replace(/\/+$/, ''),
     username:  next.username || '',
     password:  next.password || prev.password || '',
+    slots:     slots,
   };
   saveSettings(merged);
   settings = merged;
   saveToken(null); token = null;
-  console.log('[ma] settings saved');
+  pushQuickSlots();
+  console.log('[ma] settings saved (' + slots.length + ' quick slots)');
   schedulePoll(POLL_MS_AFTER_ACTION);
 });

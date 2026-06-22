@@ -31,3 +31,7 @@ Thumbs.db
 # Claude/agent state
 .claude/
 CLAUDE.md
+
+# Local-only design + session-handoff notes (kept on disk, never committed)
+CONCEPT.md
+HANDOFF.md

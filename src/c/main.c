@@ -1,21 +1,19 @@
 /*
- * pebble-musicassistant-remote
+ * pebble-musicassistant-remote — v0.2.0
  *
- * Native Pebble Time 2 (emery) watchapp.  All Music Assistant traffic happens
+ * Native Pebble Time 2 (emery) watchapp. All Music Assistant traffic happens
  * on the phone (src/pkjs/index.js); we just render state and forward user
  * intent over AppMessage.
  *
- * Two windows live on the stack:
+ * Windows on the stack:
  *
- *   1. Now-playing — default.  Status bar at the bottom is a touch target that
- *      pushes the player list.
- *   2. Player list — touch-driven row picker built on MenuLayer plus a raw
- *      TouchService overlay (MenuLayer has no native touch support on emery).
- *
- * Touch is derived from raw TouchService events: Touchdown remembers the
- * coordinates and timestamp, Liftoff resolves the gesture.  Anything within
- * TAP_SLOP_PX and TAP_MAX_MS counts as a tap; everything else is currently
- * ignored (drag/swipe land in 0.2.0).
+ *   1. Now-playing — default. Header (tap → player list), title/meta/progress,
+ *      right-edge action column (prev / play-pause / next), bottom status
+ *      strip (shuffle / repeat / volume).
+ *   2. Player list — touch-driven row picker (MenuLayer + raw TouchService).
+ *   3. Volume — UP/DOWN steps volume, SELECT mutes, Back returns.
+ *   4. Quick Play — MenuLayer of up-to-10 user-defined shortcuts; opened on
+ *      long-press SELECT from now-playing.
  */
 
 #include <pebble.h>
@@ -32,27 +30,32 @@
 #define SCREEN_W 200
 #define SCREEN_H 228
 
-// Status bar must be a comfortable touch target — the user goes here to pick
-// a player, so a thin strip won't do.
-#define STATUSBAR_H 44
-#define TRANSPORT_H 52
-#define TITLE_TOP   4
-#define TITLE_H     30
-#define META_TOP    36
-#define META_H      20
-#define PROGRESS_TOP   118
+#define HEADER_H     28
+#define HEADER_Y     0
+
+#define STRIP_H      40
+#define STRIP_Y      (SCREEN_H - STRIP_H)
+
+#define ACTION_W     34
+#define ACTION_X     (SCREEN_W - ACTION_W)
+#define ACTION_Y     HEADER_H
+#define ACTION_H     (STRIP_Y - ACTION_Y)
+#define ACTION_PILL_H ((ACTION_H) / 3)
+
+#define CONTENT_X    0
+#define CONTENT_W    (SCREEN_W - ACTION_W)
+#define CONTENT_Y    HEADER_H
+#define CONTENT_H    (STRIP_Y - CONTENT_Y)
+
+#define TITLE_TOP    (CONTENT_Y + 4)
+#define TITLE_H      30
+#define META_TOP     (TITLE_TOP + TITLE_H + 2)
+#define META_H       20
+#define PROGRESS_TOP (STRIP_Y - 36)
 #define PROGRESS_BAR_H 4
-#define TIME_TOP    126
+#define TIME_TOP     (PROGRESS_TOP + 8)
 
-#define TRANSPORT_TOP   60
-#define TRANSPORT_BTN_W 60
-#define TRANSPORT_GAP   4
-
-#define SHUFFLE_TOP 150
-#define SHUFFLE_H   32
-#define ICON_BTN_W  60
-
-#define STATUSBAR_Y (SCREEN_H - STATUSBAR_H)
+#define STRIP_ZONE_W ((SCREEN_W) / 3)
 
 // ─── Touch gesture state ───────────────────────────────────────────────────
 
@@ -93,11 +96,24 @@ typedef enum {
 #define MAX_PLAYERS     16
 #define MAX_PLAYER_ID   48
 
+#define MAX_QUICK_SLOTS  10
+#define MAX_QUICK_LABEL  41
+#define MAX_QUICK_URI    121
+
+// Persist keys for slots. Even index = label, odd = URI.
+#define PERSIST_QUICK_BASE 0x100
+#define PERSIST_QUICK_COUNT 0x0FF
+
 typedef struct {
   char          id[MAX_PLAYER_ID];
   char          name[MAX_PLAYER_NAME];
   PlaybackState state;
 } PlayerRow;
+
+typedef struct {
+  char label[MAX_QUICK_LABEL];
+  char uri[MAX_QUICK_URI];
+} QuickSlot;
 
 static struct {
   char          player_name[MAX_PLAYER_NAME];
@@ -105,7 +121,7 @@ static struct {
   char          artist[MAX_TRACK_TEXT];
   char          album[MAX_TRACK_TEXT];
   PlaybackState state;
-  uint8_t       volume;    // 0..100
+  uint8_t       volume;
   bool          muted;
   bool          shuffle;
   RepeatMode    repeat;
@@ -119,14 +135,15 @@ static struct {
   .state       = PS_UNKNOWN,
 };
 
-// Local interpolation: bump elapsed once per second while PLAYING so the
-// progress bar doesn't stall between phone polls.
 static AppTimer *s_tick_timer;
 #define TICK_MS 1000
 
-// Player list buffer; populated by chunked AppMessages from the phone.
 static PlayerRow s_players[MAX_PLAYERS];
 static int       s_players_count;
+
+static QuickSlot s_quick_slots[MAX_QUICK_SLOTS];
+static int       s_quick_count;
+static int       s_quick_recv_count;
 
 // ─── Outbound command codes (mirrors src/pkjs/index.js CMD.*) ─────────────
 
@@ -142,21 +159,21 @@ enum {
   CMD_MUTE_TOGGLE     = 9,
   CMD_SHUFFLE_TOGGLE  = 10,
   CMD_REPEAT_CYCLE    = 11,
+  CMD_QUICK_PLAY      = 12,
 };
 
 // ─── Windows ──────────────────────────────────────────────────────────────
 
 static Window     *s_now_window;
 static Layer      *s_now_root_layer;
-
 static Window     *s_players_window;
 static MenuLayer  *s_players_menu;
+static Window     *s_volume_window;
+static Layer      *s_volume_root_layer;
+static Window     *s_quick_window;
+static MenuLayer  *s_quick_menu;
 
-// ─── Helpers ──────────────────────────────────────────────────────────────
-
-// ─── Icon drawing (native primitives — Pebble fonts don't ship the unicode
-//     transport / shuffle / repeat glyphs we need, so we draw them ourselves
-//     out of triangles, rects and arcs.  Everything centres in `rect`.) ──
+// ─── Icon drawing (native primitives) ─────────────────────────────────────
 
 static void fill_triangle(GContext *ctx, GPoint a, GPoint b, GPoint c) {
   GPathInfo info = (GPathInfo){ .num_points = 3, .points = (GPoint[]){a, b, c} };
@@ -169,56 +186,54 @@ static void icon_play(GContext *ctx, GRect rect, GColor col) {
   graphics_context_set_fill_color(ctx, col);
   int cx = rect.origin.x + rect.size.w / 2;
   int cy = rect.origin.y + rect.size.h / 2;
-  int s  = 14;  // size
+  int s  = 12;
   fill_triangle(ctx,
-                GPoint(cx - s/2,     cy - s),
-                GPoint(cx - s/2,     cy + s),
-                GPoint(cx + s,       cy));
+                GPoint(cx - s/2, cy - s),
+                GPoint(cx - s/2, cy + s),
+                GPoint(cx + s,   cy));
 }
 
 static void icon_pause(GContext *ctx, GRect rect, GColor col) {
   graphics_context_set_fill_color(ctx, col);
   int cx = rect.origin.x + rect.size.w / 2;
   int cy = rect.origin.y + rect.size.h / 2;
-  graphics_fill_rect(ctx, GRect(cx - 8, cy - 12, 5, 24), 1, GCornersAll);
-  graphics_fill_rect(ctx, GRect(cx + 3, cy - 12, 5, 24), 1, GCornersAll);
+  graphics_fill_rect(ctx, GRect(cx - 7, cy - 10, 4, 20), 1, GCornersAll);
+  graphics_fill_rect(ctx, GRect(cx + 3, cy - 10, 4, 20), 1, GCornersAll);
 }
 
 static void icon_next(GContext *ctx, GRect rect, GColor col) {
   graphics_context_set_fill_color(ctx, col);
   int cx = rect.origin.x + rect.size.w / 2;
   int cy = rect.origin.y + rect.size.h / 2;
-  int s  = 10;
-  fill_triangle(ctx, GPoint(cx - 12, cy - s), GPoint(cx - 12, cy + s), GPoint(cx, cy));
-  fill_triangle(ctx, GPoint(cx,      cy - s), GPoint(cx,      cy + s), GPoint(cx + 12, cy));
-  graphics_fill_rect(ctx, GRect(cx + 12, cy - s, 3, s * 2), 0, GCornerNone);
+  int s  = 8;
+  fill_triangle(ctx, GPoint(cx - 10, cy - s), GPoint(cx - 10, cy + s), GPoint(cx - 2, cy));
+  fill_triangle(ctx, GPoint(cx - 2,  cy - s), GPoint(cx - 2,  cy + s), GPoint(cx + 6, cy));
+  graphics_fill_rect(ctx, GRect(cx + 6, cy - s, 3, s * 2), 0, GCornerNone);
 }
 
 static void icon_prev(GContext *ctx, GRect rect, GColor col) {
   graphics_context_set_fill_color(ctx, col);
   int cx = rect.origin.x + rect.size.w / 2;
   int cy = rect.origin.y + rect.size.h / 2;
-  int s  = 10;
-  graphics_fill_rect(ctx, GRect(cx - 15, cy - s, 3, s * 2), 0, GCornerNone);
-  fill_triangle(ctx, GPoint(cx + 12, cy - s), GPoint(cx + 12, cy + s), GPoint(cx, cy));
-  fill_triangle(ctx, GPoint(cx,      cy - s), GPoint(cx,      cy + s), GPoint(cx - 12, cy));
+  int s  = 8;
+  graphics_fill_rect(ctx, GRect(cx - 11, cy - s, 3, s * 2), 0, GCornerNone);
+  fill_triangle(ctx, GPoint(cx + 8, cy - s), GPoint(cx + 8, cy + s), GPoint(cx,     cy));
+  fill_triangle(ctx, GPoint(cx,     cy - s), GPoint(cx,     cy + s), GPoint(cx - 8, cy));
 }
 
 static void icon_shuffle(GContext *ctx, GRect rect, GColor col) {
   graphics_context_set_stroke_color(ctx, col);
   graphics_context_set_stroke_width(ctx, 2);
-  int x = rect.origin.x + 6;
+  int x = rect.origin.x + 2;
   int y = rect.origin.y + rect.size.h / 2;
-  int w = rect.size.w - 12;
-  // Two crossing arrows, simplified.
-  graphics_draw_line(ctx, GPoint(x,        y - 6), GPoint(x + w/2,  y - 6));
-  graphics_draw_line(ctx, GPoint(x + w/2,  y - 6), GPoint(x + w,    y + 6));
-  graphics_draw_line(ctx, GPoint(x,        y + 6), GPoint(x + w/2,  y + 6));
-  graphics_draw_line(ctx, GPoint(x + w/2,  y + 6), GPoint(x + w,    y - 6));
-  // Arrowheads
+  int w = rect.size.w - 4;
+  graphics_draw_line(ctx, GPoint(x,        y - 5), GPoint(x + w/2,  y - 5));
+  graphics_draw_line(ctx, GPoint(x + w/2,  y - 5), GPoint(x + w,    y + 5));
+  graphics_draw_line(ctx, GPoint(x,        y + 5), GPoint(x + w/2,  y + 5));
+  graphics_draw_line(ctx, GPoint(x + w/2,  y + 5), GPoint(x + w,    y - 5));
   graphics_context_set_fill_color(ctx, col);
-  fill_triangle(ctx, GPoint(x + w,     y + 6), GPoint(x + w - 6, y + 2), GPoint(x + w - 6, y + 10));
-  fill_triangle(ctx, GPoint(x + w,     y - 6), GPoint(x + w - 6, y - 2), GPoint(x + w - 6, y - 10));
+  fill_triangle(ctx, GPoint(x + w, y + 5), GPoint(x + w - 5, y + 1), GPoint(x + w - 5, y + 9));
+  fill_triangle(ctx, GPoint(x + w, y - 5), GPoint(x + w - 5, y - 1), GPoint(x + w - 5, y - 9));
 }
 
 static void icon_repeat(GContext *ctx, GRect rect, GColor col, RepeatMode mode) {
@@ -226,14 +241,12 @@ static void icon_repeat(GContext *ctx, GRect rect, GColor col, RepeatMode mode) 
   graphics_context_set_stroke_width(ctx, 2);
   int cx = rect.origin.x + rect.size.w / 2;
   int cy = rect.origin.y + rect.size.h / 2;
-  // Open square with one arrowhead.
-  graphics_draw_line(ctx, GPoint(cx - 10, cy - 7), GPoint(cx + 8,  cy - 7));
-  graphics_draw_line(ctx, GPoint(cx + 8,  cy - 7), GPoint(cx + 8,  cy + 7));
-  graphics_draw_line(ctx, GPoint(cx + 8,  cy + 7), GPoint(cx - 10, cy + 7));
-  graphics_draw_line(ctx, GPoint(cx - 10, cy + 7), GPoint(cx - 10, cy - 1));
+  graphics_draw_line(ctx, GPoint(cx - 9, cy - 6), GPoint(cx + 7,  cy - 6));
+  graphics_draw_line(ctx, GPoint(cx + 7, cy - 6), GPoint(cx + 7,  cy + 6));
+  graphics_draw_line(ctx, GPoint(cx + 7, cy + 6), GPoint(cx - 9,  cy + 6));
+  graphics_draw_line(ctx, GPoint(cx - 9, cy + 6), GPoint(cx - 9,  cy));
   graphics_context_set_fill_color(ctx, col);
-  // Arrowhead at top-right pointing right.
-  fill_triangle(ctx, GPoint(cx + 12, cy - 7), GPoint(cx + 6, cy - 11), GPoint(cx + 6, cy - 3));
+  fill_triangle(ctx, GPoint(cx + 11, cy - 6), GPoint(cx + 5, cy - 10), GPoint(cx + 5, cy - 2));
   if (mode == RM_ONE) {
     graphics_context_set_text_color(ctx, col);
     graphics_draw_text(ctx, "1", fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD),
@@ -246,9 +259,7 @@ static void icon_speaker(GContext *ctx, GRect rect, GColor col, bool muted) {
   graphics_context_set_fill_color(ctx, col);
   int x = rect.origin.x;
   int cy = rect.origin.y + rect.size.h / 2;
-  // Cabinet
   graphics_fill_rect(ctx, GRect(x + 1, cy - 5, 4, 10), 0, GCornerNone);
-  // Cone
   fill_triangle(ctx, GPoint(x + 5, cy - 5), GPoint(x + 5, cy + 5), GPoint(x + 12, cy + 8));
   fill_triangle(ctx, GPoint(x + 5, cy - 5), GPoint(x + 12, cy + 8), GPoint(x + 12, cy - 8));
   if (muted) {
@@ -258,6 +269,17 @@ static void icon_speaker(GContext *ctx, GRect rect, GColor col, bool muted) {
     graphics_draw_line(ctx, GPoint(x + 22, cy - 6), GPoint(x + 14, cy + 6));
   }
 }
+
+static void icon_chevron_right(GContext *ctx, GRect rect, GColor col) {
+  graphics_context_set_stroke_color(ctx, col);
+  graphics_context_set_stroke_width(ctx, 2);
+  int cx = rect.origin.x + rect.size.w / 2;
+  int cy = rect.origin.y + rect.size.h / 2;
+  graphics_draw_line(ctx, GPoint(cx - 3, cy - 5), GPoint(cx + 2, cy));
+  graphics_draw_line(ctx, GPoint(cx + 2, cy),     GPoint(cx - 3, cy + 5));
+}
+
+// ─── AppMessage out helpers ──────────────────────────────────────────────
 
 static void send_simple_cmd(uint8_t cmd) {
   DictionaryIterator *iter;
@@ -276,11 +298,54 @@ static void send_select_player(const char *player_id) {
   app_message_outbox_send();
 }
 
+static void send_quick_play(const char *uri) {
+  DictionaryIterator *iter;
+  if (app_message_outbox_begin(&iter) != APP_MSG_OK) return;
+  dict_write_uint8(iter, MESSAGE_KEY_CMD, CMD_QUICK_PLAY);
+  dict_write_cstring(iter, MESSAGE_KEY_ARG_STR, uri);
+  app_message_outbox_send();
+}
+
+// ─── Quick Play persistence ─────────────────────────────────────────────
+
+static void quick_load_from_persist(void) {
+  s_quick_count = 0;
+  if (!persist_exists(PERSIST_QUICK_COUNT)) return;
+  int n = persist_read_int(PERSIST_QUICK_COUNT);
+  if (n < 0) n = 0;
+  if (n > MAX_QUICK_SLOTS) n = MAX_QUICK_SLOTS;
+  for (int i = 0; i < n; i++) {
+    uint32_t klabel = PERSIST_QUICK_BASE + i * 2;
+    uint32_t kuri   = PERSIST_QUICK_BASE + i * 2 + 1;
+    if (!persist_exists(klabel) || !persist_exists(kuri)) continue;
+    persist_read_string(klabel, s_quick_slots[s_quick_count].label, MAX_QUICK_LABEL);
+    persist_read_string(kuri,   s_quick_slots[s_quick_count].uri,   MAX_QUICK_URI);
+    s_quick_count++;
+  }
+  LOGI("loaded %d quick slots", s_quick_count);
+}
+
+static void quick_save_to_persist(void) {
+  persist_write_int(PERSIST_QUICK_COUNT, s_quick_count);
+  for (int i = 0; i < s_quick_count; i++) {
+    uint32_t klabel = PERSIST_QUICK_BASE + i * 2;
+    uint32_t kuri   = PERSIST_QUICK_BASE + i * 2 + 1;
+    persist_write_string(klabel, s_quick_slots[i].label);
+    persist_write_string(kuri,   s_quick_slots[i].uri);
+  }
+  for (int i = s_quick_count; i < MAX_QUICK_SLOTS; i++) {
+    uint32_t klabel = PERSIST_QUICK_BASE + i * 2;
+    uint32_t kuri   = PERSIST_QUICK_BASE + i * 2 + 1;
+    if (persist_exists(klabel)) persist_delete(klabel);
+    if (persist_exists(kuri))   persist_delete(kuri);
+  }
+}
+
 // ─── Rendering — now-playing window ───────────────────────────────────────
 
-static void draw_progress_bar(GContext *ctx, GRect bounds) {
-  int16_t bar_x = 8;
-  int16_t bar_w = bounds.size.w - 16;
+static void draw_progress_bar(GContext *ctx) {
+  int16_t bar_x = 6;
+  int16_t bar_w = CONTENT_W - 12;
   GRect rail = GRect(bar_x, PROGRESS_TOP, bar_w, PROGRESS_BAR_H);
 
   graphics_context_set_fill_color(ctx, GColorDarkGray);
@@ -295,32 +360,46 @@ static void draw_progress_bar(GContext *ctx, GRect bounds) {
   graphics_fill_rect(ctx, GRect(bar_x, PROGRESS_TOP, fill_w, PROGRESS_BAR_H), 1, GCornersAll);
 }
 
-static void draw_volume_pips(GContext *ctx, int16_t x, int16_t y, int16_t w, int16_t h, uint8_t v) {
-  int n = 10;
-  int16_t pip_w = (w - (n - 1)) / n;
-  for (int i = 0; i < n; i++) {
-    GRect r = GRect(x + i * (pip_w + 1), y, pip_w, h);
-    bool on = (i * 10) < v;
-    graphics_context_set_fill_color(ctx, on ? GColorWhite : GColorDarkGray);
-    graphics_fill_rect(ctx, r, 0, GCornerNone);
-  }
+static void get_action_rects(GRect *r_prev, GRect *r_pp, GRect *r_next) {
+  int16_t px = ACTION_X + 2;
+  int16_t pw = ACTION_W - 4;
+  int16_t pad = 3;
+  *r_prev = GRect(px, ACTION_Y + pad,                      pw, ACTION_PILL_H - pad * 2);
+  *r_pp   = GRect(px, ACTION_Y + ACTION_PILL_H + pad,      pw, ACTION_PILL_H - pad * 2);
+  *r_next = GRect(px, ACTION_Y + ACTION_PILL_H * 2 + pad,  pw, ACTION_PILL_H - pad * 2);
+}
+
+static void get_strip_rects(GRect *r_shuf, GRect *r_rep, GRect *r_vol) {
+  *r_shuf = GRect(0,                STRIP_Y, STRIP_ZONE_W, STRIP_H);
+  *r_rep  = GRect(STRIP_ZONE_W,     STRIP_Y, STRIP_ZONE_W, STRIP_H);
+  *r_vol  = GRect(STRIP_ZONE_W * 2, STRIP_Y, SCREEN_W - STRIP_ZONE_W * 2, STRIP_H);
 }
 
 static void now_root_update(Layer *layer, GContext *ctx) {
   GRect bounds = layer_get_bounds(layer);
 
-  // Background
   graphics_context_set_fill_color(ctx, GColorBlack);
   graphics_fill_rect(ctx, bounds, 0, GCornerNone);
 
-  // Title
+  // Header.
+  GRect header = GRect(0, HEADER_Y, SCREEN_W, HEADER_H);
+  graphics_context_set_fill_color(ctx, GColorOxfordBlue);
+  graphics_fill_rect(ctx, header, 0, GCornerNone);
+  graphics_context_set_text_color(ctx, GColorWhite);
+  graphics_draw_text(ctx, s_now.player_name,
+                     fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
+                     GRect(8, HEADER_Y + 3, SCREEN_W - 30, HEADER_H - 4),
+                     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
+  icon_chevron_right(ctx, GRect(SCREEN_W - 22, HEADER_Y + 2, 18, HEADER_H - 4), GColorWhite);
+
+  // Title.
   graphics_context_set_text_color(ctx, GColorWhite);
   graphics_draw_text(ctx, s_now.title,
-                     fonts_get_system_font(FONT_KEY_GOTHIC_28_BOLD),
-                     GRect(8, TITLE_TOP, bounds.size.w - 16, TITLE_H),
+                     fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD),
+                     GRect(6, TITLE_TOP, CONTENT_W - 8, TITLE_H),
                      GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
 
-  // Artist — Album
+  // Meta.
   char meta[MAX_TRACK_TEXT * 2 + 4];
   if (s_now.artist[0] && s_now.album[0]) {
     snprintf(meta, sizeof(meta), "%s — %s", s_now.artist, s_now.album);
@@ -334,32 +413,10 @@ static void now_root_update(Layer *layer, GContext *ctx) {
   graphics_context_set_text_color(ctx, GColorLightGray);
   graphics_draw_text(ctx, meta,
                      fonts_get_system_font(FONT_KEY_GOTHIC_18),
-                     GRect(8, META_TOP, bounds.size.w - 16, META_H),
+                     GRect(6, META_TOP, CONTENT_W - 8, META_H),
                      GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
 
-  // Transport row (centre prev / play|pause / next).  Buttons are framed in
-  // a rounded rect so the touch target is visually obvious.
-  int16_t group_w = TRANSPORT_BTN_W * 3 + TRANSPORT_GAP * 2;
-  int16_t group_x = (bounds.size.w - group_w) / 2;
-  GRect r_prev = GRect(group_x,                                          TRANSPORT_TOP, TRANSPORT_BTN_W, TRANSPORT_H);
-  GRect r_pp   = GRect(group_x + (TRANSPORT_BTN_W + TRANSPORT_GAP),      TRANSPORT_TOP, TRANSPORT_BTN_W, TRANSPORT_H);
-  GRect r_next = GRect(group_x + (TRANSPORT_BTN_W + TRANSPORT_GAP) * 2,  TRANSPORT_TOP, TRANSPORT_BTN_W, TRANSPORT_H);
-
-  graphics_context_set_fill_color(ctx, GColorDarkGray);
-  graphics_fill_rect(ctx, r_prev, 6, GCornersAll);
-  graphics_fill_rect(ctx, r_pp,   6, GCornersAll);
-  graphics_fill_rect(ctx, r_next, 6, GCornersAll);
-
-  icon_prev(ctx, r_prev, GColorWhite);
-  if (s_now.state == PS_PLAYING) {
-    icon_pause(ctx, r_pp, GColorWhite);
-  } else {
-    icon_play(ctx, r_pp, GColorWhite);
-  }
-  icon_next(ctx, r_next, GColorWhite);
-
-  // Progress bar + times
-  draw_progress_bar(ctx, bounds);
+  draw_progress_bar(ctx);
 
   char times[40];
   unsigned em = s_now.elapsed_s  / 60, es = s_now.elapsed_s  % 60;
@@ -370,61 +427,87 @@ static void now_root_update(Layer *layer, GContext *ctx) {
   graphics_context_set_text_color(ctx, GColorLightGray);
   graphics_draw_text(ctx, times,
                      fonts_get_system_font(FONT_KEY_GOTHIC_14),
-                     GRect(8, TIME_TOP, bounds.size.w - 16, 18),
+                     GRect(6, TIME_TOP, CONTENT_W - 8, 18),
                      GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
 
-  // Shuffle / repeat row
-  int16_t shuf_x = 20;
-  int16_t rep_x  = bounds.size.w - 20 - ICON_BTN_W;
-  GRect r_shuf = GRect(shuf_x, SHUFFLE_TOP, ICON_BTN_W, SHUFFLE_H);
-  GRect r_rep  = GRect(rep_x,  SHUFFLE_TOP, ICON_BTN_W, SHUFFLE_H);
+  // Right-edge action column.
+  GRect r_prev, r_pp, r_next;
+  get_action_rects(&r_prev, &r_pp, &r_next);
 
-  // Subtle outline so the touch target is visible even when inactive.
-  graphics_context_set_stroke_color(ctx, GColorDarkGray);
-  graphics_draw_round_rect(ctx, r_shuf, 4);
-  graphics_draw_round_rect(ctx, r_rep,  4);
-  icon_shuffle(ctx, r_shuf, s_now.shuffle ? GColorVividCerulean : GColorLightGray);
-  icon_repeat (ctx, r_rep,  s_now.repeat == RM_OFF ? GColorLightGray : GColorVividCerulean, s_now.repeat);
-
-  // Status bar (player name + volume) — full-width tap target taking us to
-  // the player list.  Big enough to hit comfortably with a fingertip.
-  GRect status = GRect(0, STATUSBAR_Y, bounds.size.w, STATUSBAR_H);
   graphics_context_set_fill_color(ctx, GColorOxfordBlue);
-  graphics_fill_rect(ctx, status, 0, GCornerNone);
+  graphics_fill_rect(ctx, r_prev, 6, GCornersAll);
+  graphics_context_set_fill_color(ctx, GColorVividCerulean);
+  graphics_fill_rect(ctx, r_pp,   6, GCornersAll);
+  graphics_context_set_fill_color(ctx, GColorOxfordBlue);
+  graphics_fill_rect(ctx, r_next, 6, GCornersAll);
 
-  // "Tap to switch player" affordance — small chevron on the right edge.
-  graphics_context_set_stroke_color(ctx, GColorWhite);
-  graphics_context_set_stroke_width(ctx, 2);
-  int chev_x = bounds.size.w - 14;
-  int chev_y = STATUSBAR_Y + STATUSBAR_H / 2;
-  graphics_draw_line(ctx, GPoint(chev_x - 4, chev_y - 5), GPoint(chev_x, chev_y));
-  graphics_draw_line(ctx, GPoint(chev_x, chev_y), GPoint(chev_x - 4, chev_y + 5));
+  icon_prev(ctx, r_prev, GColorWhite);
+  if (s_now.state == PS_PLAYING) {
+    icon_pause(ctx, r_pp, GColorWhite);
+  } else {
+    icon_play(ctx, r_pp, GColorWhite);
+  }
+  icon_next(ctx, r_next, GColorWhite);
 
-  // Player name on the top line.
-  graphics_context_set_text_color(ctx, GColorWhite);
-  graphics_draw_text(ctx, s_now.player_name,
-                     fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
-                     GRect(28, STATUSBAR_Y + 2, bounds.size.w - 44, 22),
-                     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
+  // Bottom status strip.
+  GRect r_shuf, r_rep, r_vol;
+  get_strip_rects(&r_shuf, &r_rep, &r_vol);
 
-  // Speaker icon + volume pips on the bottom line.
-  GRect r_spk = GRect(6, STATUSBAR_Y + 22, 24, 20);
-  icon_speaker(ctx, r_spk, GColorWhite, s_now.muted);
+  GRect strip = GRect(0, STRIP_Y, SCREEN_W, STRIP_H);
+  graphics_context_set_fill_color(ctx, GColorOxfordBlue);
+  graphics_fill_rect(ctx, strip, 0, GCornerNone);
 
-  int16_t pip_x = 32;
-  int16_t pip_w = bounds.size.w - pip_x - 22;
-  draw_volume_pips(ctx, pip_x, STATUSBAR_Y + 28, pip_w, 8,
-                   s_now.muted ? 0 : s_now.volume);
+  graphics_context_set_stroke_color(ctx, GColorDarkGray);
+  graphics_context_set_stroke_width(ctx, 1);
+  graphics_draw_line(ctx, GPoint(STRIP_ZONE_W,     STRIP_Y + 8),
+                          GPoint(STRIP_ZONE_W,     STRIP_Y + STRIP_H - 8));
+  graphics_draw_line(ctx, GPoint(STRIP_ZONE_W * 2, STRIP_Y + 8),
+                          GPoint(STRIP_ZONE_W * 2, STRIP_Y + STRIP_H - 8));
 
-  // Error banner (one-line) if anything
+  GColor shuf_col = s_now.shuffle ? GColorVividCerulean : GColorLightGray;
+  icon_shuffle(ctx, GRect(r_shuf.origin.x + (STRIP_ZONE_W - 22) / 2,
+                          r_shuf.origin.y + 4, 22, 16), shuf_col);
+  graphics_context_set_text_color(ctx, shuf_col);
+  graphics_draw_text(ctx, s_now.shuffle ? "ON" : "OFF",
+                     fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD),
+                     GRect(r_shuf.origin.x, r_shuf.origin.y + 20, r_shuf.size.w, 18),
+                     GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
+
+  GColor rep_col = (s_now.repeat == RM_OFF) ? GColorLightGray : GColorVividCerulean;
+  const char *rep_label = (s_now.repeat == RM_OFF) ? "OFF" :
+                          (s_now.repeat == RM_ONE) ? "ONE" : "ALL";
+  icon_repeat(ctx, GRect(r_rep.origin.x + (STRIP_ZONE_W - 22) / 2,
+                          r_rep.origin.y + 4, 22, 16), rep_col, s_now.repeat);
+  graphics_context_set_text_color(ctx, rep_col);
+  graphics_draw_text(ctx, rep_label,
+                     fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD),
+                     GRect(r_rep.origin.x, r_rep.origin.y + 20, r_rep.size.w, 18),
+                     GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
+
+  GColor vol_col = s_now.muted ? GColorRed : GColorWhite;
+  icon_speaker(ctx, GRect(r_vol.origin.x + (r_vol.size.w - 24) / 2,
+                          r_vol.origin.y + 4, 24, 16), vol_col, s_now.muted);
+  char volbuf[8];
+  if (s_now.muted) {
+    snprintf(volbuf, sizeof(volbuf), "MUTE");
+  } else {
+    snprintf(volbuf, sizeof(volbuf), "%u%%", (unsigned)s_now.volume);
+  }
+  graphics_context_set_text_color(ctx, vol_col);
+  graphics_draw_text(ctx, volbuf,
+                     fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD),
+                     GRect(r_vol.origin.x, r_vol.origin.y + 20, r_vol.size.w, 18),
+                     GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
+
+  // Error banner.
   if (s_now.last_error[0]) {
-    GRect eb = GRect(0, 0, bounds.size.w, 16);
+    GRect eb = GRect(0, 0, bounds.size.w, 14);
     graphics_context_set_fill_color(ctx, GColorDarkCandyAppleRed);
     graphics_fill_rect(ctx, eb, 0, GCornerNone);
     graphics_context_set_text_color(ctx, GColorWhite);
     graphics_draw_text(ctx, s_now.last_error,
                        fonts_get_system_font(FONT_KEY_GOTHIC_14),
-                       GRect(4, 0, bounds.size.w - 8, 16),
+                       GRect(4, -2, bounds.size.w - 8, 16),
                        GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
   }
 }
@@ -433,57 +516,56 @@ static void now_root_update(Layer *layer, GContext *ctx) {
 
 typedef enum {
   HIT_NONE,
+  HIT_HEADER,
   HIT_PREV,
   HIT_PLAYPAUSE,
   HIT_NEXT,
   HIT_SHUFFLE,
   HIT_REPEAT,
-  HIT_STATUSBAR,
-  HIT_VOLUME_READOUT,   // tapping the pips toggles mute
+  HIT_VOLUME,
 } Hit;
 
 static Hit hit_test_now(int16_t x, int16_t y) {
-  // Whole status bar opens the player list — long-press the speaker zone
-  // (left ~32 px) to toggle mute instead.
-  if (y >= STATUSBAR_Y) {
-    if (x < 32) return HIT_VOLUME_READOUT;  // tap speaker → mute
-    return HIT_STATUSBAR;
+  if (y < HEADER_H) return HIT_HEADER;
+  if (y >= STRIP_Y) {
+    if (x < STRIP_ZONE_W)        return HIT_SHUFFLE;
+    if (x < STRIP_ZONE_W * 2)    return HIT_REPEAT;
+    return HIT_VOLUME;
   }
-  if (y >= TRANSPORT_TOP && y < TRANSPORT_TOP + TRANSPORT_H) {
-    int16_t group_w = TRANSPORT_BTN_W * 3 + TRANSPORT_GAP * 2;
-    int16_t group_x = (SCREEN_W - group_w) / 2;
-    if (x >= group_x && x < group_x + TRANSPORT_BTN_W) return HIT_PREV;
-    if (x >= group_x + TRANSPORT_BTN_W + TRANSPORT_GAP &&
-        x <  group_x + TRANSPORT_BTN_W * 2 + TRANSPORT_GAP) return HIT_PLAYPAUSE;
-    if (x >= group_x + (TRANSPORT_BTN_W + TRANSPORT_GAP) * 2 &&
-        x <  group_x + (TRANSPORT_BTN_W + TRANSPORT_GAP) * 2 + TRANSPORT_BTN_W) return HIT_NEXT;
-  }
-  if (y >= SHUFFLE_TOP && y < SHUFFLE_TOP + SHUFFLE_H) {
-    if (x < SCREEN_W / 2) return HIT_SHUFFLE;
-    return HIT_REPEAT;
+  // Right-edge action column. Use the full column width as the tap target,
+  // not just the pill — fingers are bigger than the pills.
+  if (x >= ACTION_X) {
+    int16_t ry = y - ACTION_Y;
+    if (ry < ACTION_PILL_H)            return HIT_PREV;
+    if (ry < ACTION_PILL_H * 2)        return HIT_PLAYPAUSE;
+    return HIT_NEXT;
   }
   return HIT_NONE;
 }
 
-// ─── Touch handling ───────────────────────────────────────────────────────
+// ─── Forward declarations ─────────────────────────────────────────────────
 
 static void players_window_push(void);
+static void volume_window_push(void);
+static void quick_window_push(void);
 
 static void handle_tap_now(int16_t x, int16_t y) {
   Hit h = hit_test_now(x, y);
   LOGD("tap (%d,%d) -> hit=%d", x, y, h);
   switch (h) {
-    case HIT_PREV:           send_simple_cmd(CMD_PREVIOUS);      break;
-    case HIT_PLAYPAUSE:      send_simple_cmd(CMD_PLAY_PAUSE);    break;
-    case HIT_NEXT:           send_simple_cmd(CMD_NEXT);          break;
-    case HIT_SHUFFLE:        send_simple_cmd(CMD_SHUFFLE_TOGGLE);break;
-    case HIT_REPEAT:         send_simple_cmd(CMD_REPEAT_CYCLE);  break;
-    case HIT_VOLUME_READOUT: send_simple_cmd(CMD_MUTE_TOGGLE);   break;
-    case HIT_STATUSBAR:      send_simple_cmd(CMD_REQUEST_PLAYERS);
-                             players_window_push();              break;
+    case HIT_PREV:           send_simple_cmd(CMD_PREVIOUS);       break;
+    case HIT_PLAYPAUSE:      send_simple_cmd(CMD_PLAY_PAUSE);     break;
+    case HIT_NEXT:           send_simple_cmd(CMD_NEXT);           break;
+    case HIT_SHUFFLE:        send_simple_cmd(CMD_SHUFFLE_TOGGLE); break;
+    case HIT_REPEAT:         send_simple_cmd(CMD_REPEAT_CYCLE);   break;
+    case HIT_VOLUME:         volume_window_push();                break;
+    case HIT_HEADER:         send_simple_cmd(CMD_REQUEST_PLAYERS);
+                             players_window_push();               break;
     default: break;
   }
 }
+
+// ─── Touch handling — now-playing ─────────────────────────────────────────
 
 static void touch_now_handler(const TouchEvent *e, void *ctx) {
   switch (e->type) {
@@ -514,18 +596,18 @@ static void touch_now_handler(const TouchEvent *e, void *ctx) {
   }
 }
 
-// ─── Button handlers (fallback / parity) ──────────────────────────────────
+// ─── Button handlers — now-playing ────────────────────────────────────────
 
-static void btn_select(ClickRecognizerRef r, void *c) { send_simple_cmd(CMD_PLAY_PAUSE);  }
-static void btn_up(ClickRecognizerRef r, void *c)     { send_simple_cmd(CMD_VOLUME_UP);   }
-static void btn_down(ClickRecognizerRef r, void *c)   { send_simple_cmd(CMD_VOLUME_DOWN); }
-static void btn_up_long(ClickRecognizerRef r, void *c){ send_simple_cmd(CMD_MUTE_TOGGLE); }
+static void btn_now_select(ClickRecognizerRef r, void *c)      { send_simple_cmd(CMD_PLAY_PAUSE); }
+static void btn_now_select_long(ClickRecognizerRef r, void *c) { quick_window_push(); }
+static void btn_now_up(ClickRecognizerRef r, void *c)          { send_simple_cmd(CMD_PREVIOUS);  }
+static void btn_now_down(ClickRecognizerRef r, void *c)        { send_simple_cmd(CMD_NEXT);      }
 
 static void now_click_config(void *ctx) {
-  window_single_click_subscribe(BUTTON_ID_SELECT, btn_select);
-  window_single_click_subscribe(BUTTON_ID_UP,     btn_up);
-  window_single_click_subscribe(BUTTON_ID_DOWN,   btn_down);
-  window_long_click_subscribe(BUTTON_ID_UP, 500, btn_up_long, NULL);
+  window_single_click_subscribe(BUTTON_ID_SELECT, btn_now_select);
+  window_long_click_subscribe(BUTTON_ID_SELECT, 500, btn_now_select_long, NULL);
+  window_single_click_subscribe(BUTTON_ID_UP,    btn_now_up);
+  window_single_click_subscribe(BUTTON_ID_DOWN,  btn_now_down);
 }
 
 // ─── Local interpolation tick ─────────────────────────────────────────────
@@ -546,23 +628,70 @@ static void schedule_tick(void) {
 
 // ─── Player list window ───────────────────────────────────────────────────
 
+#define PL_ROW_H 44
+
 static uint16_t pl_get_num_rows(MenuLayer *ml, uint16_t section, void *ctx) {
   return s_players_count > 0 ? s_players_count : 1;
 }
 
-static int16_t pl_get_cell_height(MenuLayer *ml, MenuIndex *idx, void *ctx) { return 36; }
+static int16_t pl_get_cell_height(MenuLayer *ml, MenuIndex *idx, void *ctx) { return PL_ROW_H; }
 
+static int16_t pl_get_sep_height(MenuLayer *ml, MenuIndex *idx, void *ctx) { return 1; }
+
+static void pl_draw_sep(GContext *ctx, const Layer *cell, MenuIndex *idx, void *c) {
+  GRect b = layer_get_bounds(cell);
+  graphics_context_set_fill_color(ctx, GColorDarkGray);
+  graphics_fill_rect(ctx, b, 0, GCornerNone);
+}
+
+// Custom row drawing — clear two-line layout with explicit padding, a
+// coloured state dot on the left, and ample gap between title and subtitle
+// so nothing overlaps.  Restored from v0.1.1 (the menu_cell_basic_draw
+// shortcut that crept back in lost the dot + spacing).
 static void pl_draw_row(GContext *ctx, const Layer *cell, MenuIndex *idx, void *c) {
+  GRect b = layer_get_bounds(cell);
+  bool hi = menu_cell_layer_is_highlighted(cell);
+
   if (s_players_count == 0) {
-    menu_cell_basic_draw(ctx, cell, "No players", "Pull to refresh", NULL);
+    graphics_context_set_text_color(ctx, hi ? GColorWhite : GColorLightGray);
+    graphics_draw_text(ctx, "No players",
+                       fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
+                       GRect(b.origin.x + 12, b.origin.y + 6, b.size.w - 24, 22),
+                       GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
+    graphics_draw_text(ctx, "Pull to refresh",
+                       fonts_get_system_font(FONT_KEY_GOTHIC_14),
+                       GRect(b.origin.x + 12, b.origin.y + 24, b.size.w - 24, 18),
+                       GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
     return;
   }
+
   const PlayerRow *p = &s_players[idx->row];
+
+  // Left dot: green = playing, amber = paused, grey = idle.
+  GColor dot =
+      p->state == PS_PLAYING ? GColorIslamicGreen :
+      p->state == PS_PAUSED  ? GColorChromeYellow : GColorDarkGray;
+  graphics_context_set_fill_color(ctx, dot);
+  graphics_fill_circle(ctx, GPoint(b.origin.x + 14, b.origin.y + PL_ROW_H / 2), 5);
+
+  // Name — always white on the row background (was black-on-black in the
+  // regressed version), or white on the cerulean highlight.
+  graphics_context_set_text_color(ctx, GColorWhite);
+  graphics_draw_text(ctx, p->name,
+                     fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
+                     GRect(b.origin.x + 28, b.origin.y + 4, b.size.w - 40, 24),
+                     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
+
+  // Subtitle: playback state, dim grey when inactive, near-white when highlighted.
   const char *sub =
       p->state == PS_PLAYING ? "Playing" :
       p->state == PS_PAUSED  ? "Paused"  :
       p->state == PS_IDLE    ? "Idle"    : "—";
-  menu_cell_basic_draw(ctx, cell, p->name, sub, NULL);
+  graphics_context_set_text_color(ctx, hi ? GColorPastelYellow : GColorLightGray);
+  graphics_draw_text(ctx, sub,
+                     fonts_get_system_font(FONT_KEY_GOTHIC_14),
+                     GRect(b.origin.x + 28, b.origin.y + 24, b.size.w - 40, 18),
+                     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
 }
 
 static void pl_select(MenuLayer *ml, MenuIndex *idx, void *c) {
@@ -573,14 +702,9 @@ static void pl_select(MenuLayer *ml, MenuIndex *idx, void *c) {
   window_stack_pop(true);
 }
 
-// Forward raw touch on the player list to MenuLayer.  Taps select the row
-// under the finger; PositionUpdate scrolls by setting the selected index based
-// on Y position to give immediate visual feedback.
 static void touch_players_handler(const TouchEvent *e, void *ctx) {
   if (!s_players_menu || s_players_count == 0) return;
-  // Crude per-row hit: divide screen height by cell height starting at top.
-  // Works for short lists; refined in 0.2.0 with scroll offset.
-  int row = e->y / 36;
+  int row = e->y / (PL_ROW_H + 1);   // include the 1-px separator
   if (row < 0) row = 0;
   if (row >= s_players_count) row = s_players_count - 1;
 
@@ -610,10 +734,12 @@ static void players_window_load(Window *w) {
   GRect bounds = layer_get_bounds(root);
   s_players_menu = menu_layer_create(bounds);
   menu_layer_set_callbacks(s_players_menu, NULL, (MenuLayerCallbacks){
-      .get_num_rows    = pl_get_num_rows,
-      .get_cell_height = pl_get_cell_height,
-      .draw_row        = pl_draw_row,
-      .select_click    = pl_select,
+      .get_num_rows         = pl_get_num_rows,
+      .get_cell_height      = pl_get_cell_height,
+      .get_separator_height = pl_get_sep_height,
+      .draw_row             = pl_draw_row,
+      .draw_separator       = pl_draw_sep,
+      .select_click         = pl_select,
   });
   menu_layer_set_click_config_onto_window(s_players_menu, w);
   menu_layer_set_normal_colors(s_players_menu, GColorBlack, GColorWhite);
@@ -640,6 +766,178 @@ static void players_window_push(void) {
   window_stack_push(s_players_window, true);
 }
 
+// ─── Volume window ────────────────────────────────────────────────────────
+
+static void volume_root_update(Layer *layer, GContext *ctx) {
+  GRect bounds = layer_get_bounds(layer);
+
+  graphics_context_set_fill_color(ctx, GColorBlack);
+  graphics_fill_rect(ctx, bounds, 0, GCornerNone);
+
+  // Title.
+  graphics_context_set_text_color(ctx, GColorWhite);
+  graphics_draw_text(ctx, "Volume",
+                     fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD),
+                     GRect(0, 8, bounds.size.w, 32),
+                     GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
+
+  // Big readout.
+  char buf[16];
+  if (s_now.muted) {
+    snprintf(buf, sizeof(buf), "MUTE");
+  } else {
+    snprintf(buf, sizeof(buf), "%u %%", (unsigned)s_now.volume);
+  }
+  graphics_context_set_text_color(ctx, s_now.muted ? GColorRed : GColorWhite);
+  graphics_draw_text(ctx, buf,
+                     fonts_get_system_font(FONT_KEY_BITHAM_42_BOLD),
+                     GRect(0, 56, bounds.size.w, 56),
+                     GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
+
+  // Chunky bar.
+  int16_t bar_x = 18;
+  int16_t bar_y = 124;
+  int16_t bar_w = bounds.size.w - 36;
+  int16_t bar_h = 14;
+  graphics_context_set_fill_color(ctx, GColorDarkGray);
+  graphics_fill_rect(ctx, GRect(bar_x, bar_y, bar_w, bar_h), 4, GCornersAll);
+  if (!s_now.muted && s_now.volume > 0) {
+    int16_t fill_w = (int16_t)((uint32_t)bar_w * s_now.volume / 100);
+    graphics_context_set_fill_color(ctx, GColorVividCerulean);
+    graphics_fill_rect(ctx, GRect(bar_x, bar_y, fill_w, bar_h), 4, GCornersAll);
+  }
+
+  icon_speaker(ctx, GRect(bar_x - 4, bar_y - 4, 24, 22), GColorWhite, s_now.muted);
+
+  // Hint.
+  graphics_context_set_text_color(ctx, GColorLightGray);
+  graphics_draw_text(ctx, "UP / DOWN — SELECT mutes",
+                     fonts_get_system_font(FONT_KEY_GOTHIC_14),
+                     GRect(0, bounds.size.h - 26, bounds.size.w, 20),
+                     GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
+}
+
+static void btn_vol_select(ClickRecognizerRef r, void *c) {
+  send_simple_cmd(CMD_MUTE_TOGGLE);
+}
+static void btn_vol_up(ClickRecognizerRef r, void *c)     { send_simple_cmd(CMD_VOLUME_UP);   }
+static void btn_vol_down(ClickRecognizerRef r, void *c)   { send_simple_cmd(CMD_VOLUME_DOWN); }
+
+static void volume_click_config(void *ctx) {
+  window_single_click_subscribe(BUTTON_ID_SELECT, btn_vol_select);
+  window_single_repeating_click_subscribe(BUTTON_ID_UP,   150, btn_vol_up);
+  window_single_repeating_click_subscribe(BUTTON_ID_DOWN, 150, btn_vol_down);
+}
+
+static void volume_window_load(Window *w) {
+  Layer *root = window_get_root_layer(w);
+  s_volume_root_layer = root;
+  layer_set_update_proc(root, volume_root_update);
+  window_set_click_config_provider(w, volume_click_config);
+}
+static void volume_window_unload(Window *w) {
+  s_volume_root_layer = NULL;
+}
+
+static void volume_window_push(void) {
+  if (!s_volume_window) {
+    s_volume_window = window_create();
+    window_set_background_color(s_volume_window, GColorBlack);
+    window_set_window_handlers(s_volume_window, (WindowHandlers){
+        .load = volume_window_load,
+        .unload = volume_window_unload,
+    });
+  }
+  window_stack_push(s_volume_window, true);
+}
+
+// ─── Quick Play window ────────────────────────────────────────────────────
+
+static uint16_t qk_get_num_rows(MenuLayer *ml, uint16_t section, void *ctx) {
+  return s_quick_count > 0 ? s_quick_count : 1;
+}
+
+static int16_t qk_get_cell_height(MenuLayer *ml, MenuIndex *idx, void *ctx) { return 36; }
+
+static void qk_draw_row(GContext *ctx, const Layer *cell, MenuIndex *idx, void *c) {
+  if (s_quick_count == 0) {
+    menu_cell_basic_draw(ctx, cell, "No shortcuts", "Add in Settings.", NULL);
+    return;
+  }
+  const QuickSlot *q = &s_quick_slots[idx->row];
+  menu_cell_basic_draw(ctx, cell, q->label, NULL, NULL);
+}
+
+static void qk_select(MenuLayer *ml, MenuIndex *idx, void *c) {
+  if (s_quick_count == 0) return;
+  const QuickSlot *q = &s_quick_slots[idx->row];
+  LOGI("quick play: %s -> %s", q->label, q->uri);
+  send_quick_play(q->uri);
+  window_stack_pop(true);
+}
+
+static void touch_quick_handler(const TouchEvent *e, void *ctx) {
+  if (!s_quick_menu || s_quick_count == 0) return;
+  int row = e->y / 36;
+  if (row < 0) row = 0;
+  if (row >= s_quick_count) row = s_quick_count - 1;
+
+  if (e->type == TouchEvent_Touchdown || e->type == TouchEvent_PositionUpdate) {
+    MenuIndex idx = { 0, (uint16_t)row };
+    menu_layer_set_selected_index(s_quick_menu, idx, MenuRowAlignCenter, false);
+  } else if (e->type == TouchEvent_Liftoff) {
+    int16_t dx = e->x - s_touch.start_x;
+    int16_t dy = e->y - s_touch.start_y;
+    uint32_t dt = time_ms(NULL, NULL) - s_touch.start_ms;
+    bool is_tap = (dx > -TAP_SLOP_PX && dx < TAP_SLOP_PX &&
+                   dy > -TAP_SLOP_PX && dy < TAP_SLOP_PX &&
+                   dt < TAP_MAX_MS);
+    if (is_tap) {
+      MenuIndex idx = { 0, (uint16_t)row };
+      qk_select(s_quick_menu, &idx, NULL);
+    }
+  }
+  if (e->type == TouchEvent_Touchdown) {
+    s_touch.start_x = e->x; s_touch.start_y = e->y;
+    s_touch.start_ms = time_ms(NULL, NULL);
+  }
+}
+
+static void quick_window_load(Window *w) {
+  Layer *root = window_get_root_layer(w);
+  GRect bounds = layer_get_bounds(root);
+  s_quick_menu = menu_layer_create(bounds);
+  menu_layer_set_callbacks(s_quick_menu, NULL, (MenuLayerCallbacks){
+      .get_num_rows    = qk_get_num_rows,
+      .get_cell_height = qk_get_cell_height,
+      .draw_row        = qk_draw_row,
+      .select_click    = qk_select,
+  });
+  menu_layer_set_click_config_onto_window(s_quick_menu, w);
+  menu_layer_set_normal_colors(s_quick_menu, GColorBlack, GColorWhite);
+  menu_layer_set_highlight_colors(s_quick_menu, GColorVividCerulean, GColorWhite);
+  layer_add_child(root, menu_layer_get_layer(s_quick_menu));
+  touch_service_unsubscribe();
+  touch_service_subscribe(touch_quick_handler, NULL);
+}
+static void quick_window_unload(Window *w) {
+  menu_layer_destroy(s_quick_menu);
+  s_quick_menu = NULL;
+  touch_service_unsubscribe();
+  touch_service_subscribe(touch_now_handler, NULL);
+}
+
+static void quick_window_push(void) {
+  if (!s_quick_window) {
+    s_quick_window = window_create();
+    window_set_window_handlers(s_quick_window, (WindowHandlers){
+        .load = quick_window_load,
+        .unload = quick_window_unload,
+    });
+  }
+  window_stack_push(s_quick_window, true);
+}
+
 // ─── AppMessage inbox ─────────────────────────────────────────────────────
 
 static void copy_tuple_str(DictionaryIterator *iter, uint32_t key, char *dst, size_t cap) {
@@ -655,7 +953,6 @@ static int32_t tuple_int(DictionaryIterator *iter, uint32_t key, int32_t fallbac
 }
 
 static void inbox_received(DictionaryIterator *iter, void *ctx) {
-  // Errors
   Tuple *err = dict_find(iter, MESSAGE_KEY_ST_ERROR);
   if (err) {
     strncpy(s_now.last_error, err->value->cstring, sizeof(s_now.last_error) - 1);
@@ -663,13 +960,12 @@ static void inbox_received(DictionaryIterator *iter, void *ctx) {
     s_now.connected = false;
     LOGE("phone error: %s", s_now.last_error);
   }
-  // Top-level OK clears the error banner.
   if (dict_find(iter, MESSAGE_KEY_ST_OK)) {
     s_now.connected = true;
     s_now.last_error[0] = '\0';
   }
 
-  // Player-list chunks
+  // Player-list chunks.
   Tuple *pl_begin = dict_find(iter, MESSAGE_KEY_PLAYERS_BEGIN);
   if (pl_begin) {
     s_players_count = 0;
@@ -690,7 +986,28 @@ static void inbox_received(DictionaryIterator *iter, void *ctx) {
     menu_layer_reload_data(s_players_menu);
   }
 
-  // Now-playing state snapshot
+  // Quick Play chunks.
+  if (dict_find(iter, MESSAGE_KEY_QUICK_BEGIN)) {
+    s_quick_recv_count = 0;
+    LOGI("quick slots reset");
+  }
+  Tuple *qk_idx = dict_find(iter, MESSAGE_KEY_QUICK_ROW_INDEX);
+  if (qk_idx) {
+    int idx = qk_idx->value->int32;
+    if (idx >= 0 && idx < MAX_QUICK_SLOTS) {
+      copy_tuple_str(iter, MESSAGE_KEY_QUICK_ROW_LABEL, s_quick_slots[idx].label, MAX_QUICK_LABEL);
+      copy_tuple_str(iter, MESSAGE_KEY_QUICK_ROW_URI,   s_quick_slots[idx].uri,   MAX_QUICK_URI);
+      if (idx + 1 > s_quick_recv_count) s_quick_recv_count = idx + 1;
+    }
+  }
+  if (dict_find(iter, MESSAGE_KEY_QUICK_END)) {
+    s_quick_count = s_quick_recv_count;
+    quick_save_to_persist();
+    LOGI("quick slots saved: %d", s_quick_count);
+    if (s_quick_menu) menu_layer_reload_data(s_quick_menu);
+  }
+
+  // Now-playing state snapshot.
   copy_tuple_str(iter, MESSAGE_KEY_ST_PLAYER_NAME, s_now.player_name, MAX_PLAYER_NAME);
   copy_tuple_str(iter, MESSAGE_KEY_ST_TITLE,       s_now.title,       MAX_TRACK_TEXT);
   copy_tuple_str(iter, MESSAGE_KEY_ST_ARTIST,      s_now.artist,      MAX_TRACK_TEXT);
@@ -712,6 +1029,7 @@ static void inbox_received(DictionaryIterator *iter, void *ctx) {
   if (t)  s_now.duration_s = (uint32_t)t->value->int32;
 
   if (s_now_root_layer) layer_mark_dirty(s_now_root_layer);
+  if (s_volume_root_layer) layer_mark_dirty(s_volume_root_layer);
 }
 
 static void inbox_dropped(AppMessageResult reason, void *ctx) {
@@ -741,6 +1059,8 @@ static void now_window_unload(Window *w) {
 // ─── App lifecycle ────────────────────────────────────────────────────────
 
 static void init(void) {
+  quick_load_from_persist();
+
   app_message_register_inbox_received(inbox_received);
   app_message_register_inbox_dropped(inbox_dropped);
   app_message_register_outbox_failed(outbox_failed);
@@ -755,19 +1075,19 @@ static void init(void) {
   });
   window_stack_push(s_now_window, true);
 
-  // Kick the phone for an initial state sync (the JS side sends READY first
-  // anyway, this is just defence in depth).
   send_simple_cmd(CMD_REQUEST_STATE);
 }
 
 static void deinit(void) {
   window_destroy(s_now_window);
   if (s_players_window) window_destroy(s_players_window);
+  if (s_volume_window)  window_destroy(s_volume_window);
+  if (s_quick_window)   window_destroy(s_quick_window);
 }
 
 int main(void) {
   init();
-  LOGI("Music Assistant remote started.");
+  LOGI("Music Assistant remote v0.2.0 started.");
   app_event_loop();
   deinit();
   return 0;

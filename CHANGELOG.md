@@ -2,7 +2,39 @@
 
 All notable changes to this project follow [Keep a Changelog](https://keepachangelog.com/) and adhere to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.2.0] — 2026-06-22
+
+UX rebuild around Pebble idiom + Quick Play shortcuts.
+
+### Added
+
+- **Right-edge action column** on now-playing — prev / play-pause (cerulean primary) / next. Hand-rolled custom layer (not `ActionBarLayer` — that doesn't support touch on emery and requires bitmap resources). Bound to UP / SELECT / DOWN hardware buttons AND tap-targets on Time 2.
+- **Bottom status strip** showing shuffle ON/OFF, repeat OFF/ALL/ONE, speaker + volume %. Tap on shuffle → toggle immediately. Tap on repeat → cycle immediately. Tap on volume cluster → opens volume window.
+- **Volume window** — dedicated full-screen control with a large percent readout and chunky bar. UP/DOWN step volume (repeating), SELECT toggles mute, Back returns. No touch on this screen (intentional, per design discussion).
+- **Quick Play** — long-press SELECT on now-playing opens a menu of up-to-10 user-curated shortcuts. Tap a row to start playback on the active player via `player_queues/play_media` with `option: "replace"`. Empty-state row prompts the user to add shortcuts in settings.
+- Slot persistence on the watch (`persist_write_string` per slot label + URI) so the Quick Play menu works before the first phone sync.
+- New AppMessage keys: `QUICK_BEGIN`, `QUICK_END`, `QUICK_ROW_INDEX`, `QUICK_ROW_LABEL`, `QUICK_ROW_URI`. New command `CMD_QUICK_PLAY = 12`.
+- **Discover panel** on the settings page — once host + credentials are entered and validated (Test Connection button does its own `POST /auth/login`), the page exposes a debounced search input with Album / Artist / Playlist filter chips, calling `music/search` directly against MA. Tap a result → adds it to the Quick Play slot list. Up to 10 slots with inline label edit, reorder, delete.
+- Settings page handles the pypkjs emulator `return_to=<localhost>/close` redirect so it works in `pebble emu-app-config` as well as on the real phone.
+
+### Fixed
+
+- Settings page was reading `body.result` for the search response; Music Assistant returns the raw `SearchResults` dict directly at the top level. Search now matches what's actually in your library.
+- Player list rendering had regressed back to `menu_cell_basic_draw` (cramped 36 px rows, packed text). Restored the v0.1.1 design: 44 px rows, explicit 1 px separators, coloured state dot (green / amber / grey) on the left, two clearly-spaced text lines (bold white name, light-grey state label), white-on-cerulean highlight.
+
+### Behaviour notes
+
+- Volume on the now-playing window is no longer on UP/DOWN — those are now transport (prev / next) to match Pebble Music idiom. To change volume, tap the volume cluster in the strip → opens the volume window.
+- Header now shows the active player name + chevron; tap to open the player list (replaces the v0.1.1 status-bar tap).
+
+### Internal
+
+- `CONCEPT.md` and `HANDOFF.md` moved to local-only (untracked) — they're working notes, not project docs.
+- Build size on emery: 65 KB `.pbw`, ~10 KB RAM, ~121 KB heap free.
+
+## [0.1.1] — 2026-06-22
+
+Touch + icon polish on top of v0.1.0.
 
 ### Fixed
 
@@ -60,4 +92,6 @@ Performance (iridium review, all post-ship polish; no correctness impact):
 - De-duplicate `menu_layer_set_selected_index()` calls during drag in the player list.
 - Rename / parameterise `clamp32` (it actually clamps to 60).
 
+[0.2.0]: https://github.com/s256/pebble-musicassistant-remote/releases/tag/v0.2.0
+[0.1.1]: https://github.com/s256/pebble-musicassistant-remote/releases/tag/v0.1.1
 [0.1.0]: https://github.com/s256/pebble-musicassistant-remote/releases/tag/v0.1.0

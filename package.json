@@ -1,7 +1,7 @@
 {
   "name": "pebble-musicassistant-remote",
   "author": "s256",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Touch-first Pebble Time 2 remote for Music Assistant.",
   "repository": {
     "type": "git",
@@ -54,7 +54,12 @@
       "PLAYER_ROW_ID",
       "PLAYER_ROW_NAME",
       "PLAYER_ROW_STATE",
-      "PLAYER_ROW_INDEX"
+      "PLAYER_ROW_INDEX",
+      "QUICK_BEGIN",
+      "QUICK_END",
+      "QUICK_ROW_INDEX",
+      "QUICK_ROW_LABEL",
+      "QUICK_ROW_URI"
     ],
     "resources": {
       "media": []
