@@ -35,3 +35,6 @@ CLAUDE.md
 # Local-only design + session-handoff notes (kept on disk, never committed)
 CONCEPT.md
 HANDOFF.md
+
+# Store / press screenshots — captured locally, uploaded out-of-band
+screenshots/
