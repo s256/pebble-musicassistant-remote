@@ -2,6 +2,25 @@
 
 All notable changes to this project follow [Keep a Changelog](https://keepachangelog.com/) and adhere to [Semantic Versioning](https://semver.org/).
 
+## [1.2.0] — 2026-06-22
+
+Two now-playing screen improvements you asked for after a real-watch testing pass.
+
+### Added
+
+- **Marquee scrolling for the title and album lines.** When either text overflows the visible band, the line pauses 3 s at the start, sweeps right-to-left at 50 px/s, snaps back, and loops. Static when the text fits. Driven by a dedicated 25 fps timer that is gated by `app_focus_service` and the now-playing window's appear/disappear handlers, so it sleeps with the watch and pauses while a sub-window is on top.
+- **Optimistic feedback on transport toggles.** Tapping play/pause, shuffle, or repeat now flips the on-screen icon the instant the touch is registered — no more 300 ms wait for the next phone poll to confirm. The next snapshot from the server overwrites if it disagrees, which is rare.
+
+### Changed
+
+- The second line of the now-playing screen now shows just the **album**. The artist still lives on line 1 (Music Assistant typically formats `current_item.name` as `Artist - Title`), so duplicating it on line 2 was wasted space.
+
+### Internal
+
+- New file-scope marquee state machine + helpers in `src/c/main.c`. Phase counter is a private monotonic ms accumulator — Pebble's `time_ms(NULL, NULL)` doesn't return a monotonic value the way the name suggests, which silently broke an earlier iteration.
+- Font-key comparison in `marquee_set_text` is now by value (`strcmp`), not pointer — Pebble's font macros are string literals that the linker doesn't always merge, so the pointer compare was producing false "text changed" results and resetting scroll on every paint.
+- The right-edge action column now paints a black mask over its band before drawing the rounded pills, so scrolling title text can't bleed into the gaps between the prev/play/next icons.
+
 ## [1.1.0] — 2026-06-22
 
 Three deliverables: a bug fix you reported on the watch, a group-volume control, and Home Assistant authentication.
@@ -158,6 +177,7 @@ Performance (iridium review, all post-ship polish; no correctness impact):
 - De-duplicate `menu_layer_set_selected_index()` calls during drag in the player list.
 - Rename / parameterise `clamp32` (it actually clamps to 60).
 
+[1.2.0]: https://github.com/s256/pebble-musicassistant-remote/releases/tag/v1.2.0
 [1.1.0]: https://github.com/s256/pebble-musicassistant-remote/releases/tag/v1.1.0
 [1.0.1]: https://github.com/s256/pebble-musicassistant-remote/releases/tag/v1.0.1
 [1.0.0]: https://github.com/s256/pebble-musicassistant-remote/releases/tag/v1.0.0
