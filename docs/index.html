@@ -471,27 +471,29 @@
   }
   applyAuthModeUI();
 
-  // Signed-in badge — shown iff we have a non-expired token AND a user record.
+  // Signed-in badge — shown iff we have a token (and ideally a user record).
+  // When the badge is shown, the auth-mode picker AND the per-mode field
+  // groups (Test connection / Sign in with HA buttons) hide — Sign out
+  // becomes the only auth control.  Reverse on sign-out.
   function renderSignedInBadge() {
-    if (token && userBlob) {
+    var signedIn = !!(token || hasExistingToken);
+    if (signedIn) {
       signedInBadge.hidden = false;
+      var user = userBlob || {};
       signedInName.textContent =
-        userBlob.display_name || userBlob.username || 'Authenticated user';
-      var role = userBlob.role || (userBlob.is_admin ? 'admin' : 'user');
+        user.display_name || user.username || 'Authenticated user';
+      var role = user.role || (user.is_admin ? 'admin' : 'user');
       var mode = authMode === 'homeassistant' ? 'Home Assistant' : 'Music Assistant';
       signedInRole.textContent = role + ' - via ' + mode;
-    } else if (hasExistingToken && userBlob) {
-      // Token isn't in this tab's memory yet (page reload), but a token was
-      // saved before — render the badge in a stale state so the user can
-      // sign out without re-authenticating.
-      signedInBadge.hidden = false;
-      signedInName.textContent =
-        userBlob.display_name || userBlob.username || 'Signed in';
-      var role2 = userBlob.role || 'user';
-      var mode2 = authMode === 'homeassistant' ? 'Home Assistant' : 'Music Assistant';
-      signedInRole.textContent = role2 + ' - via ' + mode2;
+      // Hide the entire auth-picker block; Sign out (inside the badge) is
+      // the only relevant control while we're signed in.
+      authModeRow.hidden  = true;
+      builtinFields.hidden = true;
+      haFields.hidden     = true;
     } else {
       signedInBadge.hidden = true;
+      authModeRow.hidden  = false;
+      applyAuthModeUI();
     }
   }
   renderSignedInBadge();
